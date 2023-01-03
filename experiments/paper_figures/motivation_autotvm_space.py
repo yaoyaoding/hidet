@@ -1,6 +1,7 @@
 import matplotlib.pyplot as plt
 import numpy as np
 import os
+from statistics import geometric_mean
 from common import exec_color, exec_edge_color
 
 script_dir = os.path.dirname(__file__)
@@ -39,7 +40,8 @@ colors = [
 
 def main():
     x = np.array(range(1, len(data) + 1))
-    y = np.array(data)
+    y = np.array(sorted(data, reverse=True))
+    y_avg = geometric_mean(y)
 
     fig, ax = plt.subplots(figsize=(6.4, 2.4))
     ax.bar(x, y, color=exec_color['autotvm'], edgecolor=exec_edge_color['autotvm'], width=0.70)
@@ -54,6 +56,10 @@ def main():
         yscale='log',
         yticks=[1e4, 1e5, 1e6, 1e7, 1e8]
     )
+
+    ax.axhline(y_avg, color='gray', linestyle='--', linewidth=1.5, label='Geometric mean')
+    ax.annotate(r'Geometric mean: $3.6\times 10^6$'.format(y_avg), xy=(3, y_avg), xytext=(13.5, y_avg * 1.45),
+        color='black', fontsize=14)
 
     ax.set_xlabel('Conv2d in ResNet50')
     ax.minorticks_off()
