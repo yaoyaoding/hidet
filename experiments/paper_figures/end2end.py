@@ -15,8 +15,10 @@ out_fname = os.path.join(script_dir, 'pdfs', f'{exp_name}.pdf')
 
 # plt.style.use('ggplot')
 
-font = {'family': 'serif', 'serif': ['Gentium Basic'], 'size': 15}
+# font = {'family': 'serif', 'serif': ['Gentium Basic'], 'size': 15}
+font = {'size': 15}
 plt.rc('font', **font)
+plt.rc('text', usetex=True)
 
 # plt.rcParams['text.color'] = 'blue'
 # plt.rc('text', **{'color': 'black'})
@@ -109,18 +111,20 @@ def main():
         print(model_name, latencies)
         bars = ax.bar(range(num_executors), latencies, tick_label=labels, color=executor_colors, edgecolor=executor_edge_colors)
         ax.axhline(y=data['hidet'][j], xmin=0.05, xmax=0.8, alpha=hline_alpha, color=hline_color, linestyle='dashed', lw=1.0)
-        ax.text(x=executors.index('hidet') - 0.6, y=data['hidet'][j] + y_max[j] * 0.03, s='{:.2f}x'.format(min(latencies[:-1]) / data['hidet'][j]), fontsize='x-small')
+        # ax.text(x=executors.index('hidet') - 0.6, y=data['hidet'][j] + y_max[j] * 0.03, s='{:.2f}x'.format(min(latencies[:-1]) / data['hidet'][j]), fontsize='x-small')
+        ax.text(x=executors.index('hidet') - 0.5, y=data['hidet'][j] + y_max[j] * 0.03, s='{:.2f}x'.format(min(latencies[:-1]) / data['hidet'][j]), fontsize=9)
         ax.set_ylim(top=y_max[j])
         ax.yaxis.set_major_formatter('{x:.1f}')
         ax.set_xlabel(model_name)
         if model_name in ['Bert', 'GPT-2']:
             xy = (executors.index('autotvm'), y_max[j])
-            xytext = (xy[0] - 0.36,
+            xytext = (xy[0] - 0.30,
                       xy[1] - y_max[j] * 0.12)
             ax.annotate(
                 '%.0f' % data['autotvm'][j],
                 xy,
                 xytext=xytext,
+                fontsize='small'
                 # fontsize='small',
                 # arrowprops=dict(
                 #     arrowstyle='->',
@@ -133,7 +137,7 @@ def main():
             )
         if j == 0:
             legends = ['({}) {}'.format(label, executor_name[e]) for label, e in zip(labels, executors)]
-            lgd = fig.legend(bars, legends, loc='upper center', ncol=num_executors, bbox_to_anchor=(0.5, 1.08))
+            lgd = fig.legend(bars, legends, loc='upper center', ncol=num_executors, bbox_to_anchor=(0.536, 1.08))
 
     fig.subplots_adjust(left=0.15, right=0.95, bottom=0.15, top=0.9)
     fig.savefig(out_fname, bbox_extra_artists=(lgd,), bbox_inches='tight')

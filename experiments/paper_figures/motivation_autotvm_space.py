@@ -13,8 +13,10 @@ print(out_fname)
 
 # plt.style.use('ggplot')
 
-font = {'family': 'serif', 'serif': ['Gentium Basic'], 'size': 15}
+# font = {'family': 'serif', 'serif': ['Gentium Basic'], 'size': 15}
+font = {'size': 15}
 plt.rc('font', **font)
+plt.rc('text', usetex=True)
 
 # plt.rcParams['text.color'] = 'blue'
 # plt.rc('text', **{'color': 'black'})

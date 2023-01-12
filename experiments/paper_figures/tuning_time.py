@@ -11,8 +11,10 @@ out_fname = os.path.join(script_dir, 'pdfs', f'{exp_name}.pdf')
 
 # plt.style.use('ggplot')
 
-font = {'family': 'serif', 'serif': ['Gentium Basic'], 'size': 15}
+# font = {'family': 'serif', 'serif': ['Gentium Basic'], 'size': 15}
+font = {'size': 15}
 plt.rc('font', **font)
+plt.rc('text', usetex=True)
 
 # plt.rcParams['text.color'] = 'blue'
 # plt.rc('text', **{'color': 'black'})
@@ -129,9 +131,10 @@ def main():
     def bold(s):
         return r'${' + s + r'}$'
 
-    ax.text(3.5, 8 * 60, '{} speedup tuning by \n'.format(exec_fullname['hidet']) +
-                         '{}x (AutoTVM) and {}x (Ansor)\n'.format(bold('20'), bold('11')) +
-                         'on average.'
+    ax.text(3.2, 8 * 60, '{} speedup tuning by \n'.format(exec_fullname['hidet']) +
+                         '{} (AutoTVM) and {} (Ansor)\n'.format(bold(r'\mathbf{20\times}'), bold(r'\mathbf{11\times}'))
+                         # +
+                         # 'on average.'
             )
 
     fig.subplots_adjust(left=0.15, right=0.95, bottom=0.15, top=0.9)
