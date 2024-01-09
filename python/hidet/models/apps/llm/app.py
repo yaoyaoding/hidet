@@ -16,9 +16,10 @@ class Attributes:
     block_size: int
 
 
-class LLM(CompiledApp):
+class LLM:
     def __init__(self, attrs: Attributes, memory_capacity: Optional[int] = None):
         super().__init__()
+        self.app: CompiledApp = None
         self.attributes: Attributes = attrs
         self.cache: CacheTable = CacheTable(
             num_gpu_blocks=self._get_num_cache_blocks(memory_capacity, self.attributes),
@@ -27,21 +28,22 @@ class LLM(CompiledApp):
             block_size=attrs.block_size,
         )
 
-    def _get_num_cache_blocks(self, memory_capacity: int, attrs: Attributes) -> int:
+    @staticmethod
+    def _get_num_cache_blocks(memory_capacity: int, attrs: Attributes) -> int:
         element_size = data_type(attrs.cache_dtype).nbytes
         size_per_block = attrs.num_heads * attrs.head_size * attrs.block_size * element_size
         return memory_capacity // size_per_block
 
-    def prefill(
-        self,
-        input_ids: Tensor,  # [bs, seq_length]
-        position_ids: Tensor,  # [bs, seq_length]
-    ):
+    def prefill(self, input_ids: Tensor, position_ids: Tensor):  # [bs, seq_length]  # [bs, seq_length]
         pass
 
-    def decode(
-        self,
-        input_ids: Tensor,  # [bs, seq_length]
-        position_ids: Tensor,  # [bs, seq_length]
-    ):
+    def decode(self, input_ids: Tensor, position_ids: Tensor):  # [bs, seq_length]  # [bs, seq_length]
         pass
+
+
+def build_llm():
+    pass
+
+
+def load_llm():
+    pass
