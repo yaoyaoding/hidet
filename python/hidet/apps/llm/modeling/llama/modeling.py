@@ -18,9 +18,10 @@ from transformers import LlamaConfig, LlamaTokenizer
 from transformers import LlamaForCausalLM as hfLm
 
 import hidet
+from hidet import Tensor
 from hidet.graph import nn
-from hidet.models.layers.attention import AttentionState, Attention
-from hidet.models.modeling.utils import copy_weights
+from hidet.apps.llm.nn.attention import AttentionState, Attention
+from hidet.apps.llm.modeling.pretrained import PretrainedModelForCausalLM
 
 
 class LlamaRMSNorm(nn.Module):
@@ -233,12 +234,24 @@ class LlamaModel(nn.Module):
         return hidden_states
 
 
-class LlamaForCausalLM(nn.Module):
+class LlamaForCausalLM(PretrainedModelForCausalLM):
     def __init__(self, config):
         super().__init__()
-        self.config = config
+        self.config: LlamaConfig = config
         self.model = LlamaModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+
+    def num_attention_layers(self):
+        return self.config.num_hidden_layers
+
+    def num_attention_heads(self):
+        return self.config.num_attention_heads
+
+    def attention_head_size(self):
+        return self.config.hidden_size // self.config.num_attention_heads
+
+    def embedding(self) -> Tensor:
+        return self.lm_head.transposed_weight()  # [hidden_size, vocab_size]
 
     def forward(
         self,
@@ -247,22 +260,3 @@ class LlamaForCausalLM(nn.Module):
         attn_states: List[AttentionState]
     ):
         return self.model(input_ids=input_ids, position_ids=position_ids, attn_states=attn_states)
-
-    @staticmethod
-    def from_pretrained(name='meta-llama/Llama-2-7b-chat-hf', device='cuda', dtype=hidet.float16):
-        # load the pretrained huggingface model into cpu
-        with torch.device("cuda"):  # reduce the time to load the model
-            torch_model = hfLm.from_pretrained(name, torch_dtype=torch.float16)
-
-        torch_model.cpu()
-        torch.cuda.empty_cache()
-
-        # create hidet model
-        config = torch_model.config
-        hidet_model = LlamaForCausalLM(config)
-        hidet_model.to(device=device, dtype=dtype)
-
-        # copy the weights from torch model to hidet model
-        copy_weights(torch_model, hidet_model)
-
-        return hidet_model

@@ -50,11 +50,11 @@ class DefaultAttnState(AttentionState):
 
 
 class PagedAttnState(AttentionState):
-    def __init__(self):
-        self.is_prefill: bool = True
-        self.key_cache: Optional[Tensor] = None     # [num_blocks, num_heads, head_size, block_size]
-        self.value_cache: Optional[Tensor] = None   # [num_blocks, num_heads, head_size, block_size]
-        self.cache_slots: Optional[Tensor] = None   # [bs, seq_length]
+    def __init__(self, is_prefill: bool, key_cache: Tensor, value_cache: Tensor, cache_slots: Tensor):
+        self.is_prefill: bool = is_prefill
+        self.key_cache: Optional[Tensor] = key_cache      # [num_blocks, num_heads, head_size, block_size]
+        self.value_cache: Optional[Tensor] = value_cache  # [num_blocks, num_heads, head_size, block_size]
+        self.cache_slots: Optional[Tensor] = cache_slots  # [bs, seq_length]
 
     def store_cache(self, key: Tensor, value: Tensor):
         pass

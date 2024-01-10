@@ -1,5 +1,5 @@
 """
-Copied from
+Modified from
   https://github.com/vllm-project/vllm/blob/main/vllm/sampling_params.py
 Licensed under the Apache License, Version 2.0
 """
@@ -8,6 +8,7 @@ from functools import cached_property
 from typing import Callable, List, Optional, Union
 
 import torch
+from hidet.graph.tensor import Tensor
 
 _SAMPLING_EPS = 1e-5
 
@@ -60,7 +61,6 @@ class SamplingParams:
         min_p: Float that represents the minimum probability for a token to be
             considered, relative to the probability of the most likely token.
             Must be in [0, 1]. Set to 0 to disable this.
-        use_beam_search: Whether to use beam search instead of sampling.
         length_penalty: Float that penalizes sequences based on their length.
             Used in beam search.
         early_stopping: Controls the stopping condition for beam search. It
@@ -105,7 +105,6 @@ class SamplingParams:
         top_p: float = 1.0,
         top_k: int = -1,
         min_p: float = 0.0,
-        use_beam_search: bool = False,
         length_penalty: float = 1.0,
         early_stopping: Union[bool, str] = False,
         stop: Optional[Union[str, List[str]]] = None,
@@ -128,7 +127,6 @@ class SamplingParams:
         self.top_p = top_p
         self.top_k = top_k
         self.min_p = min_p
-        self.use_beam_search = use_beam_search
         self.length_penalty = length_penalty
         self.early_stopping = early_stopping
         if stop is None:
@@ -150,16 +148,13 @@ class SamplingParams:
         self.logits_processors = logits_processors
         self.include_stop_str_in_output = include_stop_str_in_output
         self._verify_args()
-        if self.use_beam_search:
-            self._verify_beam_search()
-        else:
-            self._verify_non_beam_search()
-            if self.temperature < _SAMPLING_EPS:
-                # Zero temperature means greedy sampling.
-                self.top_p = 1.0
-                self.top_k = -1
-                self.min_p = 0.0
-                self._verify_greedy_sampling()
+        self._verify_non_beam_search()
+        if self.temperature < _SAMPLING_EPS:
+            # Zero temperature means greedy sampling.
+            self.top_p = 1.0
+            self.top_k = -1
+            self.min_p = 0.0
+            self._verify_greedy_sampling()
 
     def _verify_args(self) -> None:
         if self.n < 1:
@@ -197,21 +192,6 @@ class SamplingParams:
             raise ValueError(f"prompt_logprobs must be non-negative, got "
                              f"{self.prompt_logprobs}.")
 
-    def _verify_beam_search(self) -> None:
-        if self.best_of == 1:
-            raise ValueError("best_of must be greater than 1 when using beam "
-                             f"search. Got {self.best_of}.")
-        if self.temperature > _SAMPLING_EPS:
-            raise ValueError("temperature must be 0 when using beam search.")
-        if self.top_p < 1.0 - _SAMPLING_EPS:
-            raise ValueError("top_p must be 1 when using beam search.")
-        if self.top_k != -1:
-            raise ValueError("top_k must be -1 when using beam search.")
-        if self.early_stopping not in [True, False, "never"]:
-            raise ValueError(
-                f"early_stopping must be True, False, or 'never', "
-                f"got {self.early_stopping}.")
-
     def _verify_non_beam_search(self) -> None:
         if self.early_stopping is not False:
             raise ValueError("early_stopping is not effective and must be "
@@ -229,8 +209,6 @@ class SamplingParams:
 
     @cached_property
     def sampling_type(self) -> SamplingType:
-        if self.use_beam_search:
-            return SamplingType.BEAM
         if self.temperature < _SAMPLING_EPS:
             return SamplingType.GREEDY
         return SamplingType.RANDOM
@@ -246,7 +224,6 @@ class SamplingParams:
             f"top_p={self.top_p}, "
             f"top_k={self.top_k}, "
             f"min_p={self.min_p}, "
-            f"use_beam_search={self.use_beam_search}, "
             f"length_penalty={self.length_penalty}, "
             f"early_stopping={self.early_stopping}, "
             f"stop={self.stop}, "
@@ -259,3 +236,50 @@ class SamplingParams:
             f"skip_special_tokens={self.skip_special_tokens}, "
             "spaces_between_special_tokens="
             f"{self.spaces_between_special_tokens})")
+
+
+class SamplerOutput:
+    def __init__(self, token_id: int):
+        self.token_id: int = token_id
+
+
+class Sampler:
+    """
+    Sampler that samples the next token for all given sequences.
+
+    Note: we use PyTorch's kernels to sample for now.
+    Todo: implement these kernels based on Hidet Script
+    """
+    def __init__(self, embedding: Tensor):
+        self.embedding: torch.Tensor = embedding.torch()    # [hidden_size, vocab_size]
+
+    def sample(
+        self,
+        sequences,
+        hidden_states: Tensor   # [bs, seq_length, hidden_size]
+    ) -> List[SamplerOutput]:
+        from hidet.apps.llm.sequence import Sequence
+        sequences: List[Sequence]
+        hidden_states = hidden_states.torch()   # use torch's kernel for sampling, for now
+
+        outputs: List[SamplerOutput] = []
+
+        for index, sequence in enumerate(sequences):
+            params: SamplingParams = sequence.sampling_params
+
+            if params.sampling_type == SamplingType.GREEDY:
+                if len(sequence.output_tokens) == 0:
+                    # prefill
+                    # logits: [vocab_size]
+                    seq_hidden_states = hidden_states[index, len(sequence.prompt_tokens) - 1, :]   # [hidden_size]
+                else:
+                    # decode
+                    seq_hidden_states = hidden_states[index, 0, :]  # [hidden_size]
+                logits = torch.matmul(seq_hidden_states, self.embedding)
+                token_id: int = torch.argmax(logits).item()
+                outputs.append(SamplerOutput(token_id))
+            else:
+                # Todo: support other kinds of sampling
+                raise NotImplementedError('Current only support greedy sampling')
+
+        return outputs
