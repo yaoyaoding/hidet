@@ -1,13 +1,14 @@
 from typing import List, Optional
 from enum import StrEnum
 from .sampler import SamplingParams, SamplerOutput
+from .cache import CacheTableManager, BlockDevice
 
 
 class SequenceState(StrEnum):
     WAITING = 'waiting'
     RUNNING = 'running'
-    FINISHED_STOPPED = 'finished_STOPPED'
-    FINISHED_LENGTH = 'finished_LENGTH'
+    FINISHED_STOPPED = 'finished_stopped'
+    FINISHED_LENGTH = 'finished_length'
 
 
 class Sequence:
@@ -58,12 +59,35 @@ class SequenceOutput:
 
 
 class SequenceScheduler:
-    def __init__(self):
+    def __init__(self, cache: CacheTableManager):
+        self.cache: CacheTableManager = cache
         self.waiting: List[Sequence] = []
         self.running: List[Sequence] = []
 
+    def add_sequence(self, sequence: Sequence):
+        self.waiting.append(sequence)
+
+        # allocate virtual blocks for the sequence
+        num_blocks: int = (len(sequence.prompt_tokens) + self.cache.block_size - 1) // self.cache.block_size
+        sequence.blocks.extend(self.cache.alloc_virtual_blocks(num_blocks))
+
     def schedule(self) -> List[Sequence]:
-        pass
+        # current strategy: put all waiting requests into running list, and raise an error if there is not enough blocks
+        # todo: implement swapping strategy
+        while len(self.waiting) > 0:
+            seq = self.waiting.pop()
+
+            # all virtual blocks are not mapped to physical blocks yet, allocate gpu blocks for them
+            gpu_blocks: List[int] = self.cache.alloc_gpu_blocks(len(seq.blocks))
+
+            # map virtual blocks to gpu blocks
+            for vir_block, gpu_block in zip(seq.blocks, gpu_blocks):
+                self.cache.map_block(vir_block, BlockDevice.GPU, gpu_block)
+
+            # add the sequence to running list
+            self.running.append(seq)
+
+        return self.running
 
     def update(self):
         self.running = [sequence for sequence in self.running if not sequence.is_finished()]

@@ -239,8 +239,8 @@ class SamplingParams:
 
 
 class SamplerOutput:
-    def __init__(self, token_id: int):
-        self.token_id: int = token_id
+    def __init__(self, token: int):
+        self.token: int = token
 
 
 class Sampler:

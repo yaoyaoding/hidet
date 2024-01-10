@@ -1,4 +1,5 @@
 from typing import List, Dict, Optional
+from enum import StrEnum
 import math
 import transformers
 from hidet import nn, ops
@@ -6,13 +7,16 @@ from hidet.graph.tensor import Tensor
 
 
 class AttentionState:
+    def __init__(self, is_prefill: bool):
+        self.is_prefill: bool = is_prefill
+
     def run(self, query: Tensor, key: Tensor, value: Tensor) -> Tensor:
         raise NotImplementedError()
 
 
 class DefaultAttnState(AttentionState):
-    def __init__(self):
-        self.is_prefill: bool = True
+    def __init__(self, is_prefill: bool):
+        super().__init__(is_prefill)
         self.key_cache: Optional[Tensor] = None     # [bs, num_kv_heads, seq_length, head_size]
         self.value_cache: Optional[Tensor] = None   # [bs, num_kv_heads, seq_length, head_size]
 
@@ -51,16 +55,24 @@ class DefaultAttnState(AttentionState):
 
 class PagedAttnState(AttentionState):
     def __init__(self, is_prefill: bool, key_cache: Tensor, value_cache: Tensor, cache_slots: Tensor):
-        self.is_prefill: bool = is_prefill
-        self.key_cache: Optional[Tensor] = key_cache      # [num_blocks, num_heads, head_size, block_size]
-        self.value_cache: Optional[Tensor] = value_cache  # [num_blocks, num_heads, head_size, block_size]
-        self.cache_slots: Optional[Tensor] = cache_slots  # [bs, seq_length]
+        super().__init__(is_prefill)
+        self.key_cache: Tensor = key_cache      # [num_blocks, num_heads, head_size, block_size]
+        self.value_cache: Tensor = value_cache  # [num_blocks, num_heads, head_size, block_size]
+        self.cache_slots: Tensor = cache_slots  # [bs, seq_length]
 
     def store_cache(self, key: Tensor, value: Tensor):
         pass
 
     def run(self, query: Tensor, key: Tensor, value: Tensor) -> Tensor:
-        pass
+        if self.is_prefill:
+            # cache key and value
+            # query: [bs, num_heads, seq_length, head_size]
+            #   key: [bs, num_kv_heads, seq_length, head_size]
+            # value: [bs, num_kv_heads, seq_length, head_size]
+            # cache_slots: [bs, seq_length]
+            self.store_cache(key, value)
+        else:
+            pass
 
 
 class Attention(nn.Module):

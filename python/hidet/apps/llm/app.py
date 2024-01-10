@@ -51,11 +51,12 @@ from hidet.ir.type import data_type
 from hidet.graph.tensor import Tensor
 from hidet.apps.llm.sampler import SamplingParams
 from hidet.apps.llm.sequence import Sequence, SequenceScheduler, SequenceOutput
-from hidet.apps.llm.cache import CacheTable
+from hidet.apps.llm.cache import CacheTableManager
 from hidet.apps.llm.sampler import Sampler, SamplerOutput
 from hidet.apps.llm.tokenizer import Tokenizer
 from hidet.utils.dataclass import from_dict
-from .utils import tensor_pad
+from .utils import tensor_pad, tensor
+
 
 @dataclasses.dataclass
 class Attributes:
@@ -72,66 +73,141 @@ class LLM:
         super().__init__()
         self.compiled_app: CompiledApp = compiled_app
         self.attributes: Attributes = from_dict(Attributes, compiled_app.attributes)
-        self.scheduler: SequenceScheduler = SequenceScheduler()
         self.sampler: Sampler = Sampler(embedding=self.compiled_app.tensors['embedding'])
         self.tokenizer: Tokenizer = Tokenizer(self.attributes.tokenizer)
-        self.cache: CacheTable = CacheTable(
+        self.cache: CacheTableManager = CacheTableManager(
             dtype=data_type(self.attributes.cache_dtype),
-            memory_capacity=memory_capacity,
+            capacity=memory_capacity,
             num_layers=self.attributes.num_layers,
             num_heads=self.attributes.num_heads,
             head_size=self.attributes.head_size,
             block_size=self.attributes.block_size,
         )
+        self.scheduler: SequenceScheduler = SequenceScheduler(self.cache)
 
-    def _prefill_forward(
-        self,
-        input_ids: Tensor,  # int32 [bs, seq_len]
-        position_ids: Tensor,  # int32 [bs, seq_len]
-        cache_slots: Tensor,  # int64 [bs, seq_len]
-        seq_lengths: Tensor  # int32 [bs]
-    ) -> Tensor:
-        # prefill compiled graph:
-        pass
-
-    def _decode_forward(
-        self,
-        input_ids: Tensor,  # int32 [bs, 1]
-        position_ids: Tensor,  # int32 [bs, 1]
-        cache_slots: Tensor,  # int64 [bs, 1]
-        seq_lengths: Tensor,  # int32 [bs]
-        max_context_length: int,  # int32
-        cache_blocks: Tensor,  # int32 [bs, max_num_cache_blocks]
-    ) -> Tensor:
-        pass
+        self.cache_inputs: List[Tensor] = (
+            [kv[0] for kv in self.cache.gpu_cache.cache] + [kv[1] for kv in self.cache.gpu_cache.cache]
+        )
 
     def _prefill(self, sequences: List[Sequence]) -> Tensor:
-        import hidet
+        # prepare the inputs in the list format
+        input_ids_list: List[List[int]] = []
+        position_ids_list: List[List[int]] = []
+        cache_slots_list: List[List[int]] = []
+        seq_lengths_list: List[int] = []
+        for seq in sequences:
+            input_ids_list.append(seq.prompt_tokens)
+            position_ids_list.append(list(range(len(seq.prompt_tokens))))
 
-        max_length = max(len(seq.prompt_tokens) for seq in sequences)
-        input_ids: Tensor = tensor_pad([seq.prompt_tokens for seq in sequences], max_length)
-        position_ids: Tensor = tensor_pad([list(range(len(seq.prompt_tokens))) for seq in sequences], max_length)
-        # cache_slots: Tensor =
-        #
-        # hidden_states: Tensor = self._prefill_forward(*inputs)  # [bs, seq_len, hidden_size]
+            block_size = self.cache.block_size
+            slots = []
+            for i in range(len(seq.prompt_tokens)):
+                virtual_block: int = seq.blocks[i]
+                gpu_block: int = self.cache.mapping[virtual_block][1]
+                slot: int = gpu_block * block_size + i % block_size
+                slots.append(slot)
+            cache_slots_list.append(slots)
+            seq_lengths_list.append(len(seq.prompt_tokens))
 
+        # convert them into hidet tensors
+        input_ids: Tensor = tensor_pad(input_ids_list)
+        position_ids: Tensor = tensor_pad(position_ids_list)
+        cache_slots: Tensor = tensor_pad(cache_slots_list, pad_value=-1, dtype='int64')
+        seq_lengths: Tensor = tensor(seq_lengths_list)
+
+        # run the prefill graph
+        prefill_graph = self.compiled_app.graphs['prefill']
+        inputs = [
+            input_ids,
+            position_ids,
+            cache_slots,
+            seq_lengths,
+            *self.cache_inputs
+        ]
+        outputs: List[Tensor] = prefill_graph.run_async(inputs)
+        hidden_states: Tensor = outputs[0]  # [bs, seq_len, hidden_size]
+
+        return hidden_states
 
     def _decode(self, sequences: List[Sequence]) -> Tensor:
-        inputs: List[Tensor] = self._prepare_decode_inputs(sequences)
-        hidden_states: Tensor = self._decode_forward(*inputs)  # [bs, seq_len, hidden_size]
+        # prepare the inputs in the list format
+        input_ids_list: List[List[int]] = []
+        position_ids_list: List[List[int]] = []
+        cache_slots_list: List[List[int]] = []
+        seq_lengths_list: List[int] = []
+        max_context_length: int = 0
+        cache_blocks: List[List[int]] = []
+        for seq in sequences:
+            num_tokens = len(seq.prompt_tokens) + len(seq.output_tokens)
+            input_ids_list.append([seq.output_tokens[-1]])
+            position_ids_list.append([num_tokens - 1])
 
-        # sample the next token given the hidden states
-        sampler_outputs: List[SamplerOutput] = self.sampler.sample(sequences, hidden_states)
-        return sampler_outputs
+            block_size = self.cache.block_size
+            slots = []
+            for i in range(num_tokens):
+                virtual_block: int = seq.blocks[i // block_size]
+                gpu_block: int = self.cache.mapping[virtual_block][1]
+                slot: int = gpu_block * block_size + i % block_size
+                slots.append(slot)
+            cache_slots_list.append(slots)
+            seq_lengths_list.append(num_tokens)
+            cache_blocks.append([self.cache.mapping[virtual_block][1] for virtual_block in seq.blocks])
+            max_context_length = max(max_context_length, num_tokens)
+
+        # convert them into hidet tensors
+        input_ids: Tensor = tensor_pad(input_ids_list)
+        position_ids: Tensor = tensor_pad(position_ids_list)
+        cache_slots: Tensor = tensor_pad(cache_slots_list, pad_value=-1, dtype='int64')
+        seq_lengths: Tensor = tensor(seq_lengths_list)
+        max_context_length: Tensor = tensor(max_context_length)
+        cache_blocks: Tensor = tensor_pad(cache_blocks)
+
+        # run the prefill graph
+        prefill_graph = self.compiled_app.graphs['prefill']
+        inputs = [
+            input_ids,
+            position_ids,
+            cache_slots,
+            seq_lengths,
+            max_context_length,
+            cache_blocks,
+            *self.cache_inputs
+        ]
+        outputs: List[Tensor] = prefill_graph.run_async(inputs)
+        hidden_states: Tensor = outputs[0]  # [bs, seq_len, hidden_size]
+
+        return hidden_states
 
     def _post_process(self, sampler_outputs: List[SamplerOutput]) -> List[SequenceOutput]:
-        for sequence, sequence_output in zip(self.scheduler.running, sampler_outputs):
-            sequence.append_token(sequence_output.token)
+        sequence_outputs: List[SequenceOutput] = []
+        for sequence, sampler_output in zip(self.scheduler.running, sampler_outputs):
+            sequence.append_token(sampler_output.token)
+
+            sequence_outputs.append(
+                SequenceOutput(
+                    sequence_id=sequence.sequence_id,
+                    prompt=sequence.prompt,
+                    output_text=self.tokenizer.decode(sequence.output_tokens) if sequence.is_finished() else '',
+                    prompt_tokens=sequence.prompt_tokens,
+                    output_tokens=sequence.output_tokens,
+                    status=sequence.status
+                )
+            )
+
             if sequence.is_finished():
-                sequence_output.text = self.tokenizer.decode(sequence.output_tokens)
+                # free the virtual and gpu blocks
+                gpu_blocks = self.cache.get_mapped_blocks(sequence.blocks)
+                self.cache.unmap_blocks(sequence.blocks)
+                self.cache.free_gpu_blocks(gpu_blocks)
+                self.cache.free_virtual_blocks(sequence.blocks)
+
+        # update the scheduler status (e.g., some sequences may be finished)
+        self.scheduler.update()
+
+        return sequence_outputs
 
     def add_sequence(self, sequence_id: int, prompt: str, sampling_params: SamplingParams):
-        self.scheduler.waiting.append(
+        self.scheduler.add_sequence(
             Sequence(sequence_id, prompt, sampling_params)
         )
 
@@ -152,10 +228,7 @@ class LLM:
         # sample the next token given the hidden states
         sampler_outputs: List[SamplerOutput] = self.sampler.sample(sequences, hidden_states)
 
-        # append the next token for each sequence, incrementally detokenize the output text
+        # append the next token for each sequence, detokenize the output text (when finished)
         sequence_outputs: List[SequenceOutput] = self._post_process(sampler_outputs)
-
-        # update the scheduler status (e.g., some sequences may be finished)
-        self.scheduler.update()
 
         return sequence_outputs

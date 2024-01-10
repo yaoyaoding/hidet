@@ -245,7 +245,7 @@ def save_llm(app: LLM, path: str):
     path: str
         The path to save the LLM app.
     """
-    pass
+    raise NotImplementedError()
 
 
 def load_llm(path: str) -> LLM:
@@ -262,4 +262,4 @@ def load_llm(path: str) -> LLM:
     app: LLM
         The loaded LLM app.
     """
-    pass
+    raise NotImplementedError()
