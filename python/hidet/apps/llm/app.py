@@ -45,6 +45,7 @@ Acknowledgement:
 """
 from typing import List, Tuple, Optional
 import dataclasses
+import torch
 from hidet.runtime.compiled_app import CompiledApp, AppMetaData
 from hidet.ir.type import data_type
 from hidet.graph.tensor import Tensor
@@ -52,8 +53,9 @@ from hidet.apps.llm.sampler import SamplingParams
 from hidet.apps.llm.sequence import Sequence, SequenceScheduler, SequenceOutput
 from hidet.apps.llm.cache import CacheTable
 from hidet.apps.llm.sampler import Sampler, SamplerOutput
+from hidet.apps.llm.tokenizer import Tokenizer
 from hidet.utils.dataclass import from_dict
-
+from .utils import tensor_pad
 
 @dataclasses.dataclass
 class Attributes:
@@ -72,6 +74,7 @@ class LLM:
         self.attributes: Attributes = from_dict(Attributes, compiled_app.attributes)
         self.scheduler: SequenceScheduler = SequenceScheduler()
         self.sampler: Sampler = Sampler(embedding=self.compiled_app.tensors['embedding'])
+        self.tokenizer: Tokenizer = Tokenizer(self.attributes.tokenizer)
         self.cache: CacheTable = CacheTable(
             dtype=data_type(self.attributes.cache_dtype),
             memory_capacity=memory_capacity,
@@ -80,12 +83,6 @@ class LLM:
             head_size=self.attributes.head_size,
             block_size=self.attributes.block_size,
         )
-
-    def _prepare_prefill_inputs(self, sequences: List[Sequence]) -> List[Tensor]:
-        pass
-
-    def _prepare_decode_inputs(self, sequences: List[Sequence]) -> List[Tensor]:
-        pass
 
     def _prefill_forward(
         self,
@@ -108,15 +105,18 @@ class LLM:
     ) -> Tensor:
         pass
 
-    def _run_prefill(self, sequences: List[Sequence]) -> List[SamplerOutput]:
-        inputs: List[Tensor] = self._prepare_prefill_inputs(sequences)
-        hidden_states: Tensor = self._prefill_forward(*inputs)  # [bs, seq_len, hidden_size]
+    def _prefill(self, sequences: List[Sequence]) -> Tensor:
+        import hidet
 
-        # sample the next token given the hidden states
-        sampler_outputs: List[SamplerOutput] = self.sampler.sample(sequences, hidden_states)
-        return sampler_outputs
+        max_length = max(len(seq.prompt_tokens) for seq in sequences)
+        input_ids: Tensor = tensor_pad([seq.prompt_tokens for seq in sequences], max_length)
+        position_ids: Tensor = tensor_pad([list(range(len(seq.prompt_tokens))) for seq in sequences], max_length)
+        # cache_slots: Tensor =
+        #
+        # hidden_states: Tensor = self._prefill_forward(*inputs)  # [bs, seq_len, hidden_size]
 
-    def _run_decode(self, sequences: List[Sequence]) -> List[SamplerOutput]:
+
+    def _decode(self, sequences: List[Sequence]) -> Tensor:
         inputs: List[Tensor] = self._prepare_decode_inputs(sequences)
         hidden_states: Tensor = self._decode_forward(*inputs)  # [bs, seq_len, hidden_size]
 
@@ -125,7 +125,10 @@ class LLM:
         return sampler_outputs
 
     def _post_process(self, sampler_outputs: List[SamplerOutput]) -> List[SequenceOutput]:
-        pass
+        for sequence, sequence_output in zip(self.scheduler.running, sampler_outputs):
+            sequence.append_token(sequence_output.token)
+            if sequence.is_finished():
+                sequence_output.text = self.tokenizer.decode(sequence.output_tokens)
 
     def add_sequence(self, sequence_id: int, prompt: str, sampling_params: SamplingParams):
         self.scheduler.waiting.append(
@@ -139,12 +142,15 @@ class LLM:
         # run the sequences and get the next token for each sequence
         if all(len(seq.output_tokens) == 0 for seq in sequences):
             # prefill
-            sampler_outputs: List[SamplerOutput] = self._run_prefill(sequences)
+            hidden_states = self._prefill(sequences)
         elif all(len(seq.output_tokens) > 0 for seq in sequences):
             # decode
-            sampler_outputs: List[SamplerOutput] = self._run_decode(sequences)
+            hidden_states = self._decode(sequences)
         else:
             raise ValueError("Some sequences are prefilling and some are decoding.")
+
+        # sample the next token given the hidden states
+        sampler_outputs: List[SamplerOutput] = self.sampler.sample(sequences, hidden_states)
 
         # append the next token for each sequence, incrementally detokenize the output text
         sequence_outputs: List[SequenceOutput] = self._post_process(sampler_outputs)

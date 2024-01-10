@@ -32,6 +32,9 @@ class Sequence:
         else:
             self.status = SequenceState.RUNNING
 
+    def is_finished(self) -> bool:
+        return self.status in [SequenceState.FINISHED_STOPPED, SequenceState.FINISHED_LENGTH]
+
 
 class SequenceOutput:
     def __init__(
@@ -46,8 +49,8 @@ class SequenceOutput:
         self.sequence_id: int = sequence_id
         self.prompt: str = prompt
         self.output_text: str = output_text
-        self.prompt_ids: List[int] = prompt_tokens
-        self.output_ids: List[int] = output_tokens
+        self.prompt_tokens: List[int] = prompt_tokens
+        self.output_tokens: List[int] = output_tokens
         self.status: SequenceState = status
 
     def is_finished(self) -> bool:
@@ -63,4 +66,4 @@ class SequenceScheduler:
         pass
 
     def update(self):
-        pass
+        self.running = [sequence for sequence in self.running if not sequence.is_finished()]
