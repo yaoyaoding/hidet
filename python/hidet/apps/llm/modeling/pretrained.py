@@ -17,9 +17,11 @@ def copy_weights(torch_model: torch.nn.Module, hidet_model: nn.Module):
             member = getattr(member, m_name)
 
         if not isinstance(member, hidet.Tensor):
-            raise ValueError('PyTorch model "{}" defined a parameter "{}" that is not in the hidet model'.format(
-                torch_model.__class__.__name__, name
-            ))
+            raise ValueError(
+                'PyTorch model "{}" defined a parameter "{}" that is not in the hidet model'.format(
+                    torch_model.__class__.__name__, name
+                )
+            )
 
         src = hidet.from_torch(tensor).to(member.dtype, member.device)
         if len(src.shape) != len(member.shape) or any(a != b for a, b in zip(src.shape, member.shape)):
@@ -35,12 +37,7 @@ def copy_weights(torch_model: torch.nn.Module, hidet_model: nn.Module):
 
 
 class PretrainedModelForCausalLM(nn.Module):
-    def forward(
-        self,
-        input_ids: Tensor,
-        position_ids: Tensor,
-        attn_states: List[AttentionState]
-    ):
+    def forward(self, input_ids: Tensor, position_ids: Tensor, attn_states: List[AttentionState]):
         """
         Forward run of the model.
 
@@ -104,11 +101,7 @@ class PretrainedModelForCausalLM(nn.Module):
 
         # load the pretrained huggingface model into cpu
         with torch.device("cuda"):  # reduce the time to load the model
-            torch_model = AutoModelForCausalLM.from_pretrained(
-                name,
-                torch_dtype=torch.float16,
-                revision=revision
-            )
+            torch_model = AutoModelForCausalLM.from_pretrained(name, torch_dtype=torch.float16, revision=revision)
 
         torch_model.cpu()
         torch.cuda.empty_cache()

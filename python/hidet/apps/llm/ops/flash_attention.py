@@ -2,11 +2,7 @@ from hidet.graph.tensor import Tensor
 from hidet.graph.ops.attention import attention as _attention
 
 
-def flash_attention(
-    query: Tensor,
-    key: Tensor,
-    value: Tensor
-) -> Tensor:
+def flash_attention(query: Tensor, key: Tensor, value: Tensor) -> Tensor:
     """
     Flash attention.
 

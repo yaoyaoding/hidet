@@ -8,7 +8,7 @@ def tensor_pad(
     max_length: Optional[int] = None,
     pad_value: Any = 0,
     dtype: str = 'int32',
-    device: str = 'cuda'
+    device: str = 'cuda',
 ) -> Tensor:
     if max_length is None:
         max_length = max(len(row) for row in data)
@@ -16,9 +16,5 @@ def tensor_pad(
     return from_dlpack(torch.tensor(data, dtype=getattr(torch, dtype), device=device))
 
 
-def tensor(
-    data: Any,
-    dtype: str = 'int32',
-    device: str = 'cuda'
-) -> Tensor:
+def tensor(data: Any, dtype: str = 'int32', device: str = 'cuda') -> Tensor:
     return from_dlpack(torch.tensor(data, dtype=getattr(torch, dtype), device=device))

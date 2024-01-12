@@ -30,18 +30,13 @@ def _get_model_class(config: PretrainedConfig) -> Type[PretrainedModelForCausalL
             return model_class
     supported = '\n'.join(registry.supported_architectures())
     raise ValueError(
-        f"Model architectures {architectures} are not supported for now. \n" +
-        f"Supported architectures: \n"
+        f"Model architectures {architectures} are not supported for now. \n" + f"Supported architectures: \n"
         f"{supported}"
     )
 
 
 def _build_prefill_graph(
-    model: PretrainedModelForCausalLM,
-    device: str,
-    block_size: int,
-    dtype: str,
-    kernel_search_space: int
+    model: PretrainedModelForCausalLM, device: str, block_size: int, dtype: str, kernel_search_space: int
 ) -> CompiledGraph:
     import hidet
 
@@ -55,12 +50,10 @@ def _build_prefill_graph(
     cache_slots: Tensor = symbol(['bs', 'seq'], dtype=int64, device=device)
     seq_lengths: Tensor = symbol(['bs'], dtype=int32, device=device)
     key_caches: List[Tensor] = [
-        symbol(['blocks', num_heads, head_size, block_size], dtype=dtype, device=device)
-        for _ in range(num_layers)
+        symbol(['blocks', num_heads, head_size, block_size], dtype=dtype, device=device) for _ in range(num_layers)
     ]
     value_caches: List[Tensor] = [
-        symbol(['blocks', num_heads, head_size, block_size], dtype=dtype, device=device)
-        for _ in range(num_layers)
+        symbol(['blocks', num_heads, head_size, block_size], dtype=dtype, device=device) for _ in range(num_layers)
     ]
 
     # run the model
@@ -68,11 +61,7 @@ def _build_prefill_graph(
         PagedAttnState(is_prefill=True, key_cache=key_cache, value_cache=value_cache, cache_slots=cache_slots)
         for key_cache, value_cache in zip(key_caches, value_caches)
     ]
-    hidden_states = model.forward(
-        input_ids=input_ids,
-        position_ids=position_ids,
-        attn_states=attn_states
-    )
+    hidden_states = model.forward(input_ids=input_ids, position_ids=position_ids, attn_states=attn_states)
 
     # create the flow graph
     inputs: List[Tensor] = [input_ids, position_ids, cache_slots, seq_lengths, *key_caches, *value_caches]
@@ -89,11 +78,7 @@ def _build_prefill_graph(
 
 
 def _build_decode_graph(
-    model: PretrainedModelForCausalLM,
-    device: str,
-    block_size: int,
-    dtype: str,
-    kernel_search_space: int
+    model: PretrainedModelForCausalLM, device: str, block_size: int, dtype: str, kernel_search_space: int
 ) -> CompiledGraph:
     import hidet
 
@@ -109,12 +94,10 @@ def _build_decode_graph(
     max_context_length: Tensor = symbol([], dtype=int32, device=device)
     cache_blocks: Tensor = symbol(['bs', 'cache_blocks'], dtype=int32, device=device)
     key_caches: List[Tensor] = [
-        symbol(['blocks', num_heads, head_size, block_size], dtype=dtype, device=device)
-        for _ in range(num_layers)
+        symbol(['blocks', num_heads, head_size, block_size], dtype=dtype, device=device) for _ in range(num_layers)
     ]
     value_caches: List[Tensor] = [
-        symbol(['blocks', num_heads, head_size, block_size], dtype=dtype, device=device)
-        for _ in range(num_layers)
+        symbol(['blocks', num_heads, head_size, block_size], dtype=dtype, device=device) for _ in range(num_layers)
     ]
 
     # run the model
@@ -122,16 +105,18 @@ def _build_decode_graph(
         PagedAttnState(is_prefill=False, key_cache=key_cache, value_cache=value_cache, cache_slots=cache_slots)
         for key_cache, value_cache in zip(key_caches, value_caches)
     ]
-    hidden_states = model.forward(
-        input_ids=input_ids,
-        position_ids=position_ids,
-        attn_states=attn_states
-    )
+    hidden_states = model.forward(input_ids=input_ids, position_ids=position_ids, attn_states=attn_states)
 
     # create the flow graph
     inputs: List[Tensor] = [
-        input_ids, position_ids, cache_slots, seq_lengths, max_context_length, cache_blocks,
-        *key_caches, *value_caches
+        input_ids,
+        position_ids,
+        cache_slots,
+        seq_lengths,
+        max_context_length,
+        cache_blocks,
+        *key_caches,
+        *value_caches,
     ]
     outputs: List[Tensor] = [hidden_states, *key_caches, *value_caches]
     graph: FlowGraph = hidet.trace_from(outputs, inputs=inputs)
@@ -211,25 +196,20 @@ def build_llm(
 
     return LLM(
         compiled_app=create_compiled_app(
-            graphs={
-                'prefill': prefill_graph,
-                'decode': decode_graph
-            },
+            graphs={'prefill': prefill_graph, 'decode': decode_graph},
             modules={},
-            tensors={
-                'embedding': model.embedding(),  # [hidden_size, vocab_size]
-            },
+            tensors={'embedding': model.embedding()},  # [hidden_size, vocab_size]
             attributes={
                 'cache_dtype': dtype,
                 'num_layers': model.num_attention_layers(),
                 'num_heads': model.num_attention_heads(),
                 'head_size': model.attention_head_size(),
                 'block_size': block_size,
-                'tokenizer': config.tokenizer if tokenizer is None else tokenizer
+                'tokenizer': config.tokenizer if tokenizer is None else tokenizer,
             },
-            name='llm'
+            name='llm',
         ),
-        memory_capacity=default_memory_capacity
+        memory_capacity=default_memory_capacity,
     )
 
 

@@ -10,17 +10,17 @@ class AttentionState:
     def __init__(self, is_prefill: bool):
         self.is_prefill: bool = is_prefill
 
-    def run(self, query: Tensor, key: Tensor, value: Tensor) -> Tensor:
+    def run(self, query: Tensor, key: Tensor, value: Tensor, seq_lengths: Tensor) -> Tensor:
         raise NotImplementedError()
 
 
 class DefaultAttnState(AttentionState):
     def __init__(self, is_prefill: bool):
         super().__init__(is_prefill)
-        self.key_cache: Optional[Tensor] = None     # [bs, num_kv_heads, seq_length, head_size]
-        self.value_cache: Optional[Tensor] = None   # [bs, num_kv_heads, seq_length, head_size]
+        self.key_cache: Optional[Tensor] = None  # [bs, num_kv_heads, seq_length, head_size]
+        self.value_cache: Optional[Tensor] = None  # [bs, num_kv_heads, seq_length, head_size]
 
-    def run(self, query: Tensor, key: Tensor, value: Tensor):
+    def run(self, query: Tensor, key: Tensor, value: Tensor, seq_lengths: Tensor):
         if self.is_prefill:
             # prefill stage
             query = ops.transpose(query, axes=[0, 1, 3, 2])  # [bs, num_heads, head_size, seq_length]
@@ -30,7 +30,7 @@ class DefaultAttnState(AttentionState):
             causal_mask = (score.dtype.one - tri) * score.dtype.min_value
             score = ops.softmax(score + causal_mask, axis=-1)
             output = ops.matmul(score, value)
-            
+
             self.key_cache = key
             self.value_cache = value
             return output
@@ -47,7 +47,7 @@ class DefaultAttnState(AttentionState):
             causal_mask = (score.dtype.one - tri) * score.dtype.min_value
             score = ops.softmax(score + causal_mask, axis=-1)
             output = ops.matmul(score, value)
-            
+
             self.key_cache = key
             self.value_cache = value
             return output
@@ -56,14 +56,14 @@ class DefaultAttnState(AttentionState):
 class PagedAttnState(AttentionState):
     def __init__(self, is_prefill: bool, key_cache: Tensor, value_cache: Tensor, cache_slots: Tensor):
         super().__init__(is_prefill)
-        self.key_cache: Tensor = key_cache      # [num_blocks, num_heads, head_size, block_size]
+        self.key_cache: Tensor = key_cache  # [num_blocks, num_heads, head_size, block_size]
         self.value_cache: Tensor = value_cache  # [num_blocks, num_heads, head_size, block_size]
         self.cache_slots: Tensor = cache_slots  # [bs, seq_length]
 
     def store_cache(self, key: Tensor, value: Tensor):
         pass
 
-    def run(self, query: Tensor, key: Tensor, value: Tensor) -> Tensor:
+    def run(self, query: Tensor, key: Tensor, value: Tensor, seq_lengths: Tensor) -> Tensor:
         if self.is_prefill:
             # cache key and value
             # query: [bs, num_heads, seq_length, head_size]
@@ -79,8 +79,9 @@ class Attention(nn.Module):
     def forward(
         self,
         query: Tensor,  # [bs, num_heads, seq_length, head_size]
-        key: Tensor,    # [bs, num_kv_heads, seq_length, head_size]
+        key: Tensor,  # [bs, num_kv_heads, seq_length, head_size]
         value: Tensor,  # [bs, num_kv_heads, seq_length, head_size]
-        state: AttentionState
+        seq_lengths: Tensor,  # int32 [bs]
+        state: AttentionState,
     ):
-        return state.run(query, key, value)
+        return state.run(query, key, value, seq_lengths)

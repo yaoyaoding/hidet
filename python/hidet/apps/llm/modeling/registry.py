@@ -4,9 +4,7 @@ from hidet.graph import nn
 
 from .pretrained import PretrainedModelForCausalLM
 
-model_registry: Dict[str, Tuple[str, str]] = {
-    "LlamaForCausalLM": ("llama", "LlamaForCausalLM"),
-}
+model_registry: Dict[str, Tuple[str, str]] = {"LlamaForCausalLM": ("llama", "LlamaForCausalLM")}
 
 
 def load_model_class(arch: str) -> Optional[Type[PretrainedModelForCausalLM]]:

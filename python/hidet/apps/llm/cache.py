@@ -19,7 +19,7 @@ class CacheTable:
         num_layers: int,
         num_heads: int,
         head_size: int,
-        block_size: int
+        block_size: int,
     ):
         self.dtype: DataType = dtype
         self.device: str = device
@@ -45,8 +45,10 @@ class CacheTable:
             key_cache_shape = [self.num_blocks, self.num_heads, self.head_size, self.block_size]
             value_cache_shape = [self.num_blocks, self.num_heads, self.head_size, self.block_size]
             cache.append(
-                (empty(shape=key_cache_shape, dtype=self.dtype, device=self.device),
-                 empty(shape=value_cache_shape, dtype=self.dtype, device=self.device))
+                (
+                    empty(shape=key_cache_shape, dtype=self.dtype, device=self.device),
+                    empty(shape=value_cache_shape, dtype=self.dtype, device=self.device),
+                )
             )
         return cache
 
@@ -72,13 +74,7 @@ class CacheTable:
 
 class CacheTableManager:
     def __init__(
-        self,
-        dtype: DataType,
-        capacity: int,
-        num_layers: int,
-        num_heads: int,
-        head_size: int,
-        block_size: int
+        self, dtype: DataType, capacity: int, num_layers: int, num_heads: int, head_size: int, block_size: int
     ):
         self.dtype: DataType = dtype
         self.memory_capacity: int = capacity

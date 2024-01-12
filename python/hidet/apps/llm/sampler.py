@@ -160,52 +160,41 @@ class SamplingParams:
         if self.n < 1:
             raise ValueError(f"n must be at least 1, got {self.n}.")
         if self.best_of < self.n:
-            raise ValueError(f"best_of must be greater than or equal to n, "
-                             f"got n={self.n} and best_of={self.best_of}.")
-        if not -2.0 <= self.presence_penalty <= 2.0:
-            raise ValueError("presence_penalty must be in [-2, 2], got "
-                             f"{self.presence_penalty}.")
-        if not -2.0 <= self.frequency_penalty <= 2.0:
-            raise ValueError("frequency_penalty must be in [-2, 2], got "
-                             f"{self.frequency_penalty}.")
-        if not 0.0 < self.repetition_penalty <= 2.0:
-            raise ValueError("repetition_penalty must be in (0, 2], got "
-                             f"{self.repetition_penalty}.")
-        if self.temperature < 0.0:
             raise ValueError(
-                f"temperature must be non-negative, got {self.temperature}.")
+                f"best_of must be greater than or equal to n, " f"got n={self.n} and best_of={self.best_of}."
+            )
+        if not -2.0 <= self.presence_penalty <= 2.0:
+            raise ValueError("presence_penalty must be in [-2, 2], got " f"{self.presence_penalty}.")
+        if not -2.0 <= self.frequency_penalty <= 2.0:
+            raise ValueError("frequency_penalty must be in [-2, 2], got " f"{self.frequency_penalty}.")
+        if not 0.0 < self.repetition_penalty <= 2.0:
+            raise ValueError("repetition_penalty must be in (0, 2], got " f"{self.repetition_penalty}.")
+        if self.temperature < 0.0:
+            raise ValueError(f"temperature must be non-negative, got {self.temperature}.")
         if not 0.0 < self.top_p <= 1.0:
             raise ValueError(f"top_p must be in (0, 1], got {self.top_p}.")
         if self.top_k < -1 or self.top_k == 0:
-            raise ValueError(f"top_k must be -1 (disable), or at least 1, "
-                             f"got {self.top_k}.")
+            raise ValueError(f"top_k must be -1 (disable), or at least 1, " f"got {self.top_k}.")
         if not 0.0 <= self.min_p <= 1.0:
-            raise ValueError("min_p must be in [0, 1], got "
-                             f"{self.min_p}.")
+            raise ValueError("min_p must be in [0, 1], got " f"{self.min_p}.")
         if self.max_tokens < 1:
-            raise ValueError(
-                f"max_tokens must be at least 1, got {self.max_tokens}.")
+            raise ValueError(f"max_tokens must be at least 1, got {self.max_tokens}.")
         if self.logprobs is not None and self.logprobs < 0:
-            raise ValueError(
-                f"logprobs must be non-negative, got {self.logprobs}.")
+            raise ValueError(f"logprobs must be non-negative, got {self.logprobs}.")
         if self.prompt_logprobs is not None and self.prompt_logprobs < 0:
-            raise ValueError(f"prompt_logprobs must be non-negative, got "
-                             f"{self.prompt_logprobs}.")
+            raise ValueError(f"prompt_logprobs must be non-negative, got " f"{self.prompt_logprobs}.")
 
     def _verify_non_beam_search(self) -> None:
         if self.early_stopping is not False:
-            raise ValueError("early_stopping is not effective and must be "
-                             "False when not using beam search.")
-        if (self.length_penalty < 1.0 - _SAMPLING_EPS
-            or self.length_penalty > 1.0 + _SAMPLING_EPS):
+            raise ValueError("early_stopping is not effective and must be " "False when not using beam search.")
+        if self.length_penalty < 1.0 - _SAMPLING_EPS or self.length_penalty > 1.0 + _SAMPLING_EPS:
             raise ValueError(
-                "length_penalty is not effective and must be the "
-                "default value of 1.0 when not using beam search.")
+                "length_penalty is not effective and must be the " "default value of 1.0 when not using beam search."
+            )
 
     def _verify_greedy_sampling(self) -> None:
         if self.best_of > 1:
-            raise ValueError("best_of must be 1 when using greedy sampling."
-                             f"Got {self.best_of}.")
+            raise ValueError("best_of must be 1 when using greedy sampling." f"Got {self.best_of}.")
 
     @cached_property
     def sampling_type(self) -> SamplingType:
@@ -235,7 +224,8 @@ class SamplingParams:
             f"prompt_logprobs={self.prompt_logprobs}, "
             f"skip_special_tokens={self.skip_special_tokens}, "
             "spaces_between_special_tokens="
-            f"{self.spaces_between_special_tokens})")
+            f"{self.spaces_between_special_tokens})"
+        )
 
 
 class SamplerOutput:
@@ -250,17 +240,15 @@ class Sampler:
     Note: we use PyTorch's kernels to sample for now.
     Todo: implement these kernels based on Hidet Script
     """
-    def __init__(self, embedding: Tensor):
-        self.embedding: torch.Tensor = embedding.torch()    # [hidden_size, vocab_size]
 
-    def sample(
-        self,
-        sequences,
-        hidden_states: Tensor   # [bs, seq_length, hidden_size]
-    ) -> List[SamplerOutput]:
+    def __init__(self, embedding: Tensor):
+        self.embedding: torch.Tensor = embedding.torch()  # [hidden_size, vocab_size]
+
+    def sample(self, sequences, hidden_states: Tensor) -> List[SamplerOutput]:  # [bs, seq_length, hidden_size]
         from hidet.apps.llm.sequence import Sequence
+
         sequences: List[Sequence]
-        hidden_states = hidden_states.torch()   # use torch's kernel for sampling, for now
+        hidden_states = hidden_states.torch()  # use torch's kernel for sampling, for now
 
         outputs: List[SamplerOutput] = []
 
@@ -271,7 +259,7 @@ class Sampler:
                 if len(sequence.output_tokens) == 0:
                     # prefill
                     # logits: [vocab_size]
-                    seq_hidden_states = hidden_states[index, len(sequence.prompt_tokens) - 1, :]   # [hidden_size]
+                    seq_hidden_states = hidden_states[index, len(sequence.prompt_tokens) - 1, :]  # [hidden_size]
                 else:
                     # decode
                     seq_hidden_states = hidden_states[index, 0, :]  # [hidden_size]

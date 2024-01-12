@@ -10,9 +10,11 @@ from dataclasses import asdict
 import numpy as np
 
 import hidet.utils
-from hidet.graph.tensor import Tensor
 from hidet.runtime.compiled_module import CompiledModule, CompiledFunction
 from hidet.runtime.compiled_graph import CompiledGraph, save_compiled_graph, load_compiled_graph, GraphExecution
+
+
+Tensor = 'hidet.graph.tensor.Tensor'  # used in type hint
 
 
 @dataclasses.dataclass
@@ -30,7 +32,7 @@ class CompiledApp:
         graphs: Dict[str, CompiledGraph],
         modules: Dict[str, CompiledModule],
         tensors: Dict[str, Tensor],
-        attributes: Dict[str, Union[bool, int, float, str]]
+        attributes: Dict[str, Union[bool, int, float, str]],
     ):
         self.meta: AppMetaData = meta
         self.graphs: Dict[str, CompiledGraph] = graphs
@@ -43,7 +45,7 @@ def create_compiled_app(
     modules: Dict[str, CompiledModule],
     tensors: Dict[str, Tensor],
     attributes: Dict[str, Union[bool, int, float, str]],
-    name: Optional[str] = None
+    name: Optional[str] = None,
 ) -> CompiledApp:
     """
     Create a compiled app from a dict of compiled graphs.
@@ -81,13 +83,7 @@ def create_compiled_app(
     app_hash: str = hash_obj.hexdigest()[:16]
 
     meta = AppMetaData(name=name, hidet_version=hidet.__version__, graphs=list(graphs.keys()), app_hash=app_hash)
-    return CompiledApp(
-        meta=meta,
-        graphs=graphs,
-        modules=modules,
-        tensors=tensors,
-        attributes=attributes
-    )
+    return CompiledApp(meta=meta, graphs=graphs, modules=modules, tensors=tensors, attributes=attributes)
 
 
 def save_compiled_app(app: CompiledApp, path: str):
@@ -200,4 +196,4 @@ def load_compiled_app(path: str) -> CompiledApp:
                     graph_weights.append(device2weights[device][weight_index])
             graphs[graph_name].set_weights(graph_weights)
 
-        return CompiledApp(meta=meta, graphs=graphs)
+        return CompiledApp(meta=meta, graphs=graphs, modules={}, tensors={}, attributes={})

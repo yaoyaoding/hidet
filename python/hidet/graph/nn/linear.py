@@ -34,7 +34,7 @@ class Linear(Module):
     def transposed_weight(self) -> Tensor:
         if not self._transposed:
             self._transposed = True
-            self._transposed_weight = ops.transpose(self.weight, [1, 0])    # [in_features, out_features]
+            self._transposed_weight = ops.transpose(self.weight, [1, 0])  # [in_features, out_features]
             self.weight = None
         return self._transposed_weight
 

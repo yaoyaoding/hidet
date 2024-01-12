@@ -85,9 +85,9 @@ class LLM:
         )
         self.scheduler: SequenceScheduler = SequenceScheduler(self.cache)
 
-        self.cache_inputs: List[Tensor] = (
-            [kv[0] for kv in self.cache.gpu_cache.cache] + [kv[1] for kv in self.cache.gpu_cache.cache]
-        )
+        self.cache_inputs: List[Tensor] = [kv[0] for kv in self.cache.gpu_cache.cache] + [
+            kv[1] for kv in self.cache.gpu_cache.cache
+        ]
 
     def _prefill(self, sequences: List[Sequence]) -> Tensor:
         # prepare the inputs in the list format
@@ -117,13 +117,7 @@ class LLM:
 
         # run the prefill graph
         prefill_graph = self.compiled_app.graphs['prefill']
-        inputs = [
-            input_ids,
-            position_ids,
-            cache_slots,
-            seq_lengths,
-            *self.cache_inputs
-        ]
+        inputs = [input_ids, position_ids, cache_slots, seq_lengths, *self.cache_inputs]
         outputs: List[Tensor] = prefill_graph.run_async(inputs)
         hidden_states: Tensor = outputs[0]  # [bs, seq_len, hidden_size]
 
@@ -171,7 +165,7 @@ class LLM:
             seq_lengths,
             max_context_length,
             cache_blocks,
-            *self.cache_inputs
+            *self.cache_inputs,
         ]
         outputs: List[Tensor] = prefill_graph.run_async(inputs)
         hidden_states: Tensor = outputs[0]  # [bs, seq_len, hidden_size]
@@ -190,7 +184,7 @@ class LLM:
                     output_text=self.tokenizer.decode(sequence.output_tokens) if sequence.is_finished() else '',
                     prompt_tokens=sequence.prompt_tokens,
                     output_tokens=sequence.output_tokens,
-                    status=sequence.status
+                    status=sequence.status,
                 )
             )
 
@@ -207,9 +201,7 @@ class LLM:
         return sequence_outputs
 
     def add_sequence(self, sequence_id: int, prompt: str, sampling_params: SamplingParams):
-        self.scheduler.add_sequence(
-            Sequence(sequence_id, prompt, sampling_params)
-        )
+        self.scheduler.add_sequence(Sequence(sequence_id, prompt, sampling_params))
 
     def step(self) -> List[SequenceOutput]:
         # schedule for the next step, got the sequences to run

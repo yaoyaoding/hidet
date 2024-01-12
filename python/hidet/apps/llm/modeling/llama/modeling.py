@@ -132,10 +132,7 @@ class LlamaAttention(nn.Module):
         self.rotary_emb = LlamaRotaryEmbedding(self.head_dim, max_position_embeddings=self.max_position_embeddings)
 
     def forward(
-        self,
-        hidden_states: hidet.Tensor,
-        position_ids: hidet.Tensor,
-        attn_state: AttentionState
+        self, hidden_states: hidet.Tensor, position_ids: hidet.Tensor, attn_state: AttentionState
     ) -> Tuple[hidet.Tensor, Tuple[hidet.Tensor, hidet.Tensor]]:
         bs, seq, _ = hidden_states.shape
         query_states = self.q_proj(hidden_states).reshape([bs, seq, self.num_heads, self.head_dim]).transpose(1, 2)
@@ -150,12 +147,7 @@ class LlamaAttention(nn.Module):
         cos, sin = self.rotary_emb(value_states, kv_seq_len)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
-        attn_output = self.self_attn(
-            query_states,
-            key_states,
-            value_states,
-            attn_state
-        )
+        attn_output = self.self_attn(query_states, key_states, value_states, attn_state)
 
         attn_output = attn_output.transpose(1, 2)
         attn_output = attn_output.reshape([bs, seq, self.hidden_size])
@@ -174,21 +166,14 @@ class LlamaDecoderLayer(nn.Module):
         self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
-        self,
-        hidden_states: hidet.Tensor,
-        position_ids: Optional[hidet.Tensor],
-        attn_state: AttentionState
+        self, hidden_states: hidet.Tensor, position_ids: Optional[hidet.Tensor], attn_state: AttentionState
     ) -> Tuple[hidet.Tensor, Optional[Tuple[hidet.Tensor, hidet.Tensor]]]:
         residual = hidden_states
 
         hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
-        hidden_states = self.self_attn(
-            hidden_states=hidden_states,
-            position_ids=position_ids,
-            attn_state=attn_state
-        )
+        hidden_states = self.self_attn(hidden_states=hidden_states, position_ids=position_ids, attn_state=attn_state)
         hidden_states = residual + hidden_states
 
         # Fully Connected
@@ -217,12 +202,7 @@ class LlamaModel(nn.Module):
         self.layers = nn.ModuleList([LlamaDecoderLayer(config) for _ in range(config.num_hidden_layers)])
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    def forward(
-        self,
-        input_ids: hidet.Tensor,
-        position_ids: hidet.Tensor,
-        attn_states: List[AttentionState]
-    ):
+    def forward(self, input_ids: hidet.Tensor, position_ids: hidet.Tensor, attn_states: List[AttentionState]):
         hidden_states = self.embed_tokens(input_ids)
 
         # decoder layers
@@ -253,10 +233,5 @@ class LlamaForCausalLM(PretrainedModelForCausalLM):
     def embedding(self) -> Tensor:
         return self.lm_head.transposed_weight()  # [hidden_size, vocab_size]
 
-    def forward(
-        self,
-        input_ids: hidet.Tensor,
-        position_ids: hidet.Tensor,
-        attn_states: List[AttentionState]
-    ):
+    def forward(self, input_ids: hidet.Tensor, position_ids: hidet.Tensor, attn_states: List[AttentionState]):
         return self.model(input_ids=input_ids, position_ids=position_ids, attn_states=attn_states)
