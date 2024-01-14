@@ -1,10 +1,10 @@
 from typing import List, Optional
-from enum import StrEnum
+from enum import Enum
 from .sampler import SamplingParams, SamplerOutput
 from .cache import CacheTableManager, BlockDevice
 
 
-class SequenceState(StrEnum):
+class SequenceState(Enum):
     WAITING = 'waiting'
     RUNNING = 'running'
     FINISHED_STOPPED = 'finished_stopped'

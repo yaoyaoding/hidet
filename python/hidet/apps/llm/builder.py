@@ -3,21 +3,21 @@ Builds a LLM app.
 """
 from typing import Optional, Type, List
 from transformers import PretrainedConfig, AutoConfig
-from hidet.ir.dtypes import int32, int64, float16, float32
+import hidet.option
+from hidet.ir.dtypes import int32, int64, DataType
 from hidet.graph import FlowGraph
-from hidet.apps.llm.app import LLM, Attributes
+from hidet.apps.llm.app import LLM
 from hidet.graph.tensor import symbol, Tensor
-from hidet.apps.llm import nn
 from hidet.apps.llm.modeling import registry, PretrainedModelForCausalLM
 from hidet.apps.llm.nn.attention import PagedAttnState
 from hidet.runtime.compiled_app import create_compiled_app
 from hidet.runtime.compiled_graph import CompiledGraph
-from hidet.utils.dataclass import from_dict
 
 
 def _load_pretrained_config(model: str, revision: Optional[str]) -> PretrainedConfig:
     try:
-        return AutoConfig.from_pretrained(model, revision=revision)
+        huggingface_token = hidet.option.get_option('tokens.for_huggingface')
+        return AutoConfig.from_pretrained(model, revision=revision, token=huggingface_token)
     except ValueError as e:
         raise e
 
@@ -36,13 +36,14 @@ def _get_model_class(config: PretrainedConfig) -> Type[PretrainedModelForCausalL
 
 
 def _build_prefill_graph(
-    model: PretrainedModelForCausalLM, device: str, block_size: int, dtype: str, kernel_search_space: int
+    model: PretrainedModelForCausalLM, device: str, block_size: int, kernel_search_space: int
 ) -> CompiledGraph:
     import hidet
 
     num_layers: int = model.num_attention_layers()
     num_heads: int = model.num_attention_heads()
     head_size: int = model.attention_head_size()
+    dtype: DataType = model.dtype()
 
     # create the input tensors
     input_ids: Tensor = symbol(['bs', 'seq'], dtype=int32, device=device)
@@ -58,7 +59,13 @@ def _build_prefill_graph(
 
     # run the model
     attn_states = [
-        PagedAttnState(is_prefill=True, key_cache=key_cache, value_cache=value_cache, cache_slots=cache_slots)
+        PagedAttnState(
+            is_prefill=True,
+            seq_lengths=seq_lengths,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            cache_slots=cache_slots
+        )
         for key_cache, value_cache in zip(key_caches, value_caches)
     ]
     hidden_states = model.forward(input_ids=input_ids, position_ids=position_ids, attn_states=attn_states)
@@ -78,13 +85,14 @@ def _build_prefill_graph(
 
 
 def _build_decode_graph(
-    model: PretrainedModelForCausalLM, device: str, block_size: int, dtype: str, kernel_search_space: int
+    model: PretrainedModelForCausalLM, device: str, block_size: int, kernel_search_space: int
 ) -> CompiledGraph:
     import hidet
 
     num_layers: int = model.num_attention_layers()
     num_heads: int = model.num_attention_heads()
     head_size: int = model.attention_head_size()
+    dtype: DataType = model.dtype()
 
     # create the input tensors
     input_ids: Tensor = symbol(['bs', 1], dtype=int32, device=device)
@@ -102,8 +110,14 @@ def _build_decode_graph(
 
     # run the model
     attn_states = [
-        PagedAttnState(is_prefill=False, key_cache=key_cache, value_cache=value_cache, cache_slots=cache_slots)
-        for key_cache, value_cache in zip(key_caches, value_caches)
+        PagedAttnState(
+            is_prefill=False,
+            seq_lengths=seq_lengths,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            cache_slots=cache_slots,
+            cache_blocks=cache_blocks
+        ) for key_cache, value_cache in zip(key_caches, value_caches)
     ]
     hidden_states = model.forward(input_ids=input_ids, position_ids=position_ids, attn_states=attn_states)
 
@@ -130,7 +144,7 @@ def _build_decode_graph(
     return compiled_graph
 
 
-def build_llm(
+def create_llm(
     name: str,
     tokenizer: Optional[str] = None,
     revision: Optional[str] = None,
@@ -186,12 +200,12 @@ def build_llm(
 
     # build the prefill graph
     prefill_graph = _build_prefill_graph(
-        model, device=device, block_size=block_size, dtype=dtype, kernel_search_space=kernel_search_space
+        model, device=device, block_size=block_size, kernel_search_space=kernel_search_space
     )
 
     # build the decode graph
     decode_graph = _build_decode_graph(
-        model, device=device, block_size=block_size, dtype=dtype, kernel_search_space=kernel_search_space
+        model, device=device, block_size=block_size, kernel_search_space=kernel_search_space
     )
 
     return LLM(

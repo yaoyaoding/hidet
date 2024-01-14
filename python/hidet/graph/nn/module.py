@@ -24,19 +24,23 @@ class Module:
         self._submodules: OrderedDict[str, Optional[Module]] = OrderedDict()
 
     def __setattr__(self, key, value):
-        parameters = self.__dict__.get('parameters')
-        submodules = self.__dict__.get('submodules')
+        parameters = self.__dict__.get('_parameters')
+        submodules = self.__dict__.get('_submodules')
         if isinstance(value, Tensor):
             value.name = key
             self._parameters[key] = value
+            if key in self.__dict__:
+                del self.__dict__[key]
         elif isinstance(value, Module):
             value.name = '{}.{}'.format(self.name, key) if self.name else key
             self._submodules[key] = value
         elif parameters and submodules and value is None and (key in parameters or key in submodules):
             if key in self._parameters:
-                self._parameters[key] = value
+                self.__dict__[key] = value
+                del self._parameters[key]
             if key in self._submodules:
-                self._submodules[key] = value
+                self.__dict__[key] = value
+                del self._submodules[key]
         else:
             super().__setattr__(key, value)
         cnt = sum(1 for collection in [parameters, submodules, self.__dict__] if collection and key in collection)

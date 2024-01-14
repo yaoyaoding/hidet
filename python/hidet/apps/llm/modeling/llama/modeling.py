@@ -19,6 +19,7 @@ from transformers import LlamaForCausalLM as hfLm
 
 import hidet
 from hidet import Tensor
+from hidet.ir.type import DataType, data_type
 from hidet.graph import nn
 from hidet.apps.llm.nn.attention import AttentionState, Attention
 from hidet.apps.llm.modeling.pretrained import PretrainedModelForCausalLM
@@ -232,6 +233,9 @@ class LlamaForCausalLM(PretrainedModelForCausalLM):
 
     def embedding(self) -> Tensor:
         return self.lm_head.transposed_weight()  # [hidden_size, vocab_size]
+
+    def dtype(self):
+        return data_type(str(self.config.torch_dtype).split('.')[1])
 
     def forward(self, input_ids: hidet.Tensor, position_ids: hidet.Tensor, attn_states: List[AttentionState]):
         return self.model(input_ids=input_ids, position_ids=position_ids, attn_states=attn_states)

@@ -1,16 +1,16 @@
-from typing import List, Dict, Optional
-from enum import StrEnum
+from typing import Optional
 import math
-import transformers
 from hidet import nn, ops
 from hidet.graph.tensor import Tensor
+
+from hidet.apps.llm.ops import flash_attention, page_attention, cache_write
 
 
 class AttentionState:
     def __init__(self, is_prefill: bool):
         self.is_prefill: bool = is_prefill
 
-    def run(self, query: Tensor, key: Tensor, value: Tensor, seq_lengths: Tensor) -> Tensor:
+    def run(self, query: Tensor, key: Tensor, value: Tensor) -> Tensor:
         raise NotImplementedError()
 
 
@@ -20,7 +20,7 @@ class DefaultAttnState(AttentionState):
         self.key_cache: Optional[Tensor] = None  # [bs, num_kv_heads, seq_length, head_size]
         self.value_cache: Optional[Tensor] = None  # [bs, num_kv_heads, seq_length, head_size]
 
-    def run(self, query: Tensor, key: Tensor, value: Tensor, seq_lengths: Tensor):
+    def run(self, query: Tensor, key: Tensor, value: Tensor):
         if self.is_prefill:
             # prefill stage
             query = ops.transpose(query, axes=[0, 1, 3, 2])  # [bs, num_heads, head_size, seq_length]
@@ -54,25 +54,38 @@ class DefaultAttnState(AttentionState):
 
 
 class PagedAttnState(AttentionState):
-    def __init__(self, is_prefill: bool, key_cache: Tensor, value_cache: Tensor, cache_slots: Tensor):
+    def __init__(
+        self,
+        is_prefill: bool,
+        seq_lengths: Tensor,
+        key_cache: Tensor,
+        value_cache: Tensor,
+        cache_slots: Tensor,
+        cache_blocks: Optional[Tensor] = None
+    ):
         super().__init__(is_prefill)
+        self.seq_lengths: Tensor = seq_lengths  # [bs]
         self.key_cache: Tensor = key_cache  # [num_blocks, num_heads, head_size, block_size]
         self.value_cache: Tensor = value_cache  # [num_blocks, num_heads, head_size, block_size]
-        self.cache_slots: Tensor = cache_slots  # [bs, seq_length]
+        self.cache_slots: Tensor = cache_slots  # [bs, max_seq_length]
+        self.cache_blocks: Optional[Tensor] = cache_blocks  # [bs, max_cache_blocks]
 
-    def store_cache(self, key: Tensor, value: Tensor):
-        pass
+    def run(self, query: Tensor, key: Tensor, value: Tensor) -> Tensor:
+        # write the key and value to cache
+        self.key_cache, self.value_cache = cache_write(
+            self.seq_lengths, key, value, self.cache_slots, self.key_cache, self.value_cache
+        )
 
-    def run(self, query: Tensor, key: Tensor, value: Tensor, seq_lengths: Tensor) -> Tensor:
         if self.is_prefill:
-            # cache key and value
-            # query: [bs, num_heads, seq_length, head_size]
-            #   key: [bs, num_kv_heads, seq_length, head_size]
-            # value: [bs, num_kv_heads, seq_length, head_size]
-            # cache_slots: [bs, seq_length]
-            self.store_cache(key, value)
+            return flash_attention(query=query, key=key, value=value)
         else:
-            pass
+            return page_attention(
+                query=query,
+                seq_lengths=self.seq_lengths,
+                cache_blocks=self.cache_blocks,
+                key_cache=self.key_cache,
+                value_cache=self.value_cache
+            )
 
 
 class Attention(nn.Module):
@@ -81,7 +94,6 @@ class Attention(nn.Module):
         query: Tensor,  # [bs, num_heads, seq_length, head_size]
         key: Tensor,  # [bs, num_kv_heads, seq_length, head_size]
         value: Tensor,  # [bs, num_kv_heads, seq_length, head_size]
-        seq_lengths: Tensor,  # int32 [bs]
         state: AttentionState,
     ):
-        return state.run(query, key, value, seq_lengths)
+        return state.run(query, key, value)

@@ -1,5 +1,7 @@
 from typing import Optional, Set, List, Type
 import torch
+import hidet.option
+from hidet.ir.type import DataType
 from hidet.graph.tensor import Tensor
 from hidet.apps.llm import nn
 from hidet.ir.dtypes import float16
@@ -72,8 +74,11 @@ class PretrainedModelForCausalLM(nn.Module):
         # with shape [vocab_size, hidden_size]
         raise NotImplementedError()
 
+    def dtype(self) -> DataType:
+        raise NotImplementedError()
+
     @classmethod
-    def from_pretrained(cls: Type, name: str, device='cuda', dtype='float16', revision: Optional[str] = None):
+    def from_pretrained(cls: Type, name: str, device='cuda', dtype=None, revision: Optional[str] = None):
         """
         Load a pretrained model from huggingface and convert it to hidet causal model.
 
@@ -85,7 +90,7 @@ class PretrainedModelForCausalLM(nn.Module):
         device: str
             The device of the model to be loaded to.
 
-        dtype: str
+        dtype: str, optional
             The dtype of the model to be loaded to.
 
         revision: Optional[str]
@@ -101,13 +106,22 @@ class PretrainedModelForCausalLM(nn.Module):
 
         # load the pretrained huggingface model into cpu
         with torch.device("cuda"):  # reduce the time to load the model
-            torch_model = AutoModelForCausalLM.from_pretrained(name, torch_dtype=torch.float16, revision=revision)
+            huggingface_token = hidet.option.get_option('tokens.for_huggingface')
+            torch_model = AutoModelForCausalLM.from_pretrained(
+                name, torch_dtype=torch.float16, revision=revision, token=huggingface_token
+            )
 
-        torch_model.cpu()
+        torch_model = torch_model.cpu()
         torch.cuda.empty_cache()
 
         # create hidet model
         config = torch_model.config
+        if dtype is None:
+            if config.torch_dtype:
+                assert isinstance(config.torch_dtype, torch.dtype)
+                dtype = str(config.torch_dtype).split('.')[-1]
+            else:
+                dtype = 'float16'
         hidet_model = cls(config)
         hidet_model.to(device=device, dtype=dtype)
 

@@ -25,17 +25,18 @@ class Linear(Module):
         else:
             self.bias = None
 
-        self._transposed = False
         self._transposed_weight = None
 
     def extra_str(self) -> str:
         return 'in_features={}, out_features={}'.format(self.in_features, self.out_features)
 
     def transposed_weight(self) -> Tensor:
-        if not self._transposed:
-            self._transposed = True
+        if not self._transposed_weight:
             self._transposed_weight = ops.transpose(self.weight, [1, 0])  # [in_features, out_features]
+            from hidet.runtime.storage import current_memory_pool
+            print('before ', current_memory_pool('cuda'))
             self.weight = None
+            print('after ', current_memory_pool('cuda'))
         return self._transposed_weight
 
     def forward(self, x: Tensor) -> Tensor:
