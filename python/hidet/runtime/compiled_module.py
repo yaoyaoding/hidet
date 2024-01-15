@@ -43,10 +43,11 @@ class CompiledFunction:
         The ctypes function, which holds the actual function pointer loaded in memory.
     """
 
-    def __init__(self, name, func_type: FuncType, ctypes_func):
+    def __init__(self, name, func_type: FuncType, ctypes_func, lib_path: str):
         self.name: str = name
         self.func_type: FuncType = func_type
         self.ctypes_func: Callable = ctypes_func
+        self.lib_path: str = lib_path
 
         self._update_func_signature()
 
@@ -70,7 +71,13 @@ class CompiledFunction:
 
         status = get_last_error()
         if status is not None:
-            msg = 'Calling {} with arguments {} failed. error:\n{}'.format(self.name, args, status)
+            from hidet.graph.tensor import Tensor
+            args_str = ', '.join([arg.signature() if isinstance(arg, Tensor) else str(arg) for arg in args])
+            msg = (
+                'Calling {} with arguments ({}) failed. error:\n'.format(self.name, args_str) +
+                '{}\n'.format(status) +
+                'Function @ {}'.format(self.lib_path)
+            )
             raise BackendException(msg)
 
         return ret
@@ -262,7 +269,9 @@ class CompiledModule:
             func_types: Dict[str, FuncType] = pickle.load(f)
         functions: Dict[str, CompiledFunction] = {}
         for name, func_type in func_types.items():
-            functions[name] = CompiledFunction(name, func_type, self.shared_library['hidet_' + name])
+            functions[name] = CompiledFunction(
+                name, func_type, self.shared_library['hidet_' + name], self.shared_library.lib_path
+            )
         return functions
 
     def source(self, color=False) -> Optional[str]:

@@ -1,6 +1,7 @@
-from typing import Tuple, List, Dict
+from typing import Tuple, List, Dict, Optional
 from hidet.ir.type import data_type, DataType
 from hidet.graph.tensor import Tensor, empty
+from hidet.runtime.storage import current_memory_pool, MemoryPool
 
 KVCache = Tuple[Tensor, Tensor]
 
@@ -31,8 +32,8 @@ class CacheTable:
 
         self.num_blocks: int = self._calc_num_blocks(memory_capacity)
 
-        self._cache: List[KVCache] = self._allocate_cache_table()
-        self._free_blocks: List[int] = list(range(self.num_blocks))
+        self.cache: List[KVCache] = self._allocate_cache_table()
+        self._free_blocks: List[int] = list(reversed(range(self.num_blocks)))
 
     def _calc_num_blocks(self, memory_capacity: int) -> int:
         element_size: int = data_type(self.dtype).nbytes
@@ -41,6 +42,10 @@ class CacheTable:
 
     def _allocate_cache_table(self) -> List[KVCache]:
         cache: List[KVCache] = []
+
+        if self.device == 'virtual':
+            return []
+
         for _ in range(self.num_layers):
             key_cache_shape = [self.num_blocks, self.num_heads, self.head_size, self.block_size]
             value_cache_shape = [self.num_blocks, self.num_heads, self.head_size, self.block_size]
@@ -74,22 +79,43 @@ class CacheTable:
 
 class CacheTableManager:
     def __init__(
-        self, dtype: DataType, capacity: int, num_layers: int, num_heads: int, head_size: int, block_size: int
+        self, dtype: DataType, capacity: Optional[int], num_layers: int, num_heads: int, head_size: int, block_size: int
     ):
         self.dtype: DataType = dtype
-        self.memory_capacity: int = capacity
         self.num_layers: int = num_layers
         self.num_heads: int = num_heads
         self.head_size: int = head_size
         self.block_size: int = block_size
+        self.capacity: int = self._capacity(capacity)
 
-        self.virtual_cache = CacheTable(dtype, 'virtual', 2 * capacity, num_layers, num_heads, head_size, block_size)
-        self.cpu_cache = CacheTable(dtype, 'cpu', capacity, num_layers, num_heads, head_size, block_size)
-        self.gpu_cache = CacheTable(dtype, 'cuda', capacity, num_layers, num_heads, head_size, block_size)
+        self.virtual_cache = CacheTable(
+            dtype, 'virtual', 2 * self.capacity, num_layers, num_heads, head_size, block_size
+        )
+        self.cpu_cache = CacheTable(dtype, 'cpu', self.capacity, num_layers, num_heads, head_size, block_size)
+        self.gpu_cache = CacheTable(dtype, 'cuda', self.capacity, num_layers, num_heads, head_size, block_size)
 
         # the mapping from virtual block number to the physical block number
         # {virtual_block_number: (block_device, physical_block_number)}
         self.mapping: Dict[int, Tuple[int, int]] = {}
+
+    def _capacity(
+        self,
+        capacity: Optional[int],
+        percentage: float = 0.9
+    ) -> int:
+        if capacity is None:
+            # clear the reserved memory in the current memory pool
+            current_memory_pool('cuda').clear()
+
+            # query the available memory
+            import hidet.cuda
+            free, total = hidet.cuda.memory_info()
+            free = int(free * percentage)
+
+            size_per_layer = self.num_heads * self.head_size * self.block_size * self.dtype.nbytes
+            capacity = free // size_per_layer // 2  # 2 for key and value
+
+        return capacity
 
     def alloc_virtual_blocks(self, num_blocks: int) -> List[int]:
         return self.virtual_cache.alloc_blocks(num_blocks)

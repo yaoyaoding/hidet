@@ -1,14 +1,15 @@
 from typing import List
 from transformers import AutoTokenizer, LlamaTokenizer
+import hidet.option
 
 
 # Use the tokenizer from huggingface, for now
 class Tokenizer:
     def __init__(self, name):
-        self.hf_tokenizer = AutoTokenizer.from_pretrained(name)
+        token = hidet.option.get_option('tokens.for_huggingface')
+        self.hf_tokenizer = AutoTokenizer.from_pretrained(name, token=token)
 
     def encode(self, text) -> List[int]:
-        LlamaTokenizer.encode()
         return self.hf_tokenizer.encode(text)
 
     def decode(self, ids) -> str:

@@ -14,7 +14,8 @@ from tqdm import tqdm
 
 import torch
 import transformers
-from transformers import LlamaConfig, LlamaTokenizer
+from transformers import LlamaConfig, LlamaTokenizer, LlamaTokenizerFast
+from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from transformers import LlamaForCausalLM as hfLm
 
 import hidet
@@ -63,9 +64,13 @@ class LlamaRotaryEmbedding(nn.Module):
 
     def forward(self, x, seq_len):
         # x: [bs, num_attention_heads, seq_len, head_size]
+        # return (
+        #     self.cos_cached[:, :, :seq_len, ...].to(dtype=x.dtype),
+        #     self.sin_cached[:, :, :seq_len, ...].to(dtype=x.dtype),
+        # )
         return (
-            self.cos_cached[:, :, :seq_len, ...].to(dtype=x.dtype),
-            self.sin_cached[:, :, :seq_len, ...].to(dtype=x.dtype),
+            self.cos_cached.to(dtype=x.dtype),
+            self.sin_cached.to(dtype=x.dtype),
         )
 
 

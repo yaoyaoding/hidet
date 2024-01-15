@@ -45,6 +45,7 @@ class PageAttentionWriteCacheOp(OpaqueOperator):
     def implement_cuda(self, inputs: List[Tensor], outputs: List[Tensor]) -> Union[IRModule, List[IRModule]]:
         return tune.extract_ir_modules(self.schedule_cuda)
 
+    @tune.space(1)  # empty space
     def schedule_cuda(self):
         import hidet
         from hidet.lang import attrs
@@ -55,8 +56,8 @@ class PageAttentionWriteCacheOp(OpaqueOperator):
         num_blocks, num_kv_heads, head_size, block_size = self.inputs[4].shape
 
         with hidet.script_module() as script_module:
-            seq_tile = 32
-            dim_tile = 32
+            seq_tile = 1
+            dim_tile = 1
             assert int(head_size % (dim_tile * 4)) == 0
             assert int(block_size % (seq_tile * 4)) == 0
 
@@ -209,21 +210,20 @@ class PageAttentionOp(OpaqueOperator):
     def implement_cuda(self, inputs: List[Tensor], outputs: List[Tensor]) -> Union[IRModule, List[IRModule]]:
         return tune.extract_ir_modules(self.schedule_cuda)
 
+    @tune.space(1)  # empty space
     def schedule_cuda(self) -> IRModule:
         # naive implementation, todo: optimize this kernel
         import hidet
         from hidet.lang import attrs, cast
-        from hidet.lang.types import f16, f32, i32, register_tensor
+        from hidet.lang.types import u8, f16, f32, i32, register_tensor, tensor_pointer_type, tensor_pointer
         from hidet.lang.cuda import memcpy_async, blockIdx, threadIdx, shfl_down_sync, shfl_sync, blockDim
         from hidet.ir.primitives.math import exp
         from hidet.ir.primitives import runtime
 
-        _query, _seq_lengths, _cache_blocks, _key_cache, _value_cache = self.inputs[0]
+        _query, _seq_lengths, _cache_blocks, _key_cache, _value_cache = self.inputs
         bs, num_heads, _, head_size = self.inputs[0].shape
         max_cache_blocks = _cache_blocks.shape[-1]
         num_blocks, num_kv_heads, head_size, block_size = _key_cache.shape
-
-        max_seq_length = symbol_var('max_seq_length')
 
         tile_size = 128
 
@@ -231,10 +231,11 @@ class PageAttentionOp(OpaqueOperator):
         with hidet.script_module() as script_module:
             @hidet.script
             def page_attention_score(
-                score: f32[bs, num_heads, max_seq_length],
+                max_seq_length: i32,
+                score_ptr: ~f32,
                 query: f16[bs, num_heads, head_size],
-                seq_lengths: f16[bs],
-                cache_blocks: f16[bs, max_cache_blocks],
+                seq_lengths: i32[bs],
+                cache_blocks: i32[bs, max_cache_blocks],
                 key_cache: f16[num_blocks, num_kv_heads, head_size, block_size],
             ):
                 attrs.func_kind = 'cuda_kernel'
@@ -244,12 +245,14 @@ class PageAttentionOp(OpaqueOperator):
                 bs_idx = blockIdx.z
                 head_idx = blockIdx.y
 
+                score = tensor_pointer(f32, [bs, num_heads, max_seq_length], init=score_ptr)
+
                 j = blockIdx.x * tile_size + threadIdx.x
                 seq_length = seq_lengths[bs_idx]
 
                 if j < seq_length:
                     acc = f16.zero
-                    block_idx = cache_blocks[j // block_size]
+                    block_idx = cache_blocks[bs_idx, j // block_size]
                     block_offset = j % block_size
                     kv_head_idx = head_idx % num_kv_heads
                     for k in range(head_size):
@@ -268,13 +271,17 @@ class PageAttentionOp(OpaqueOperator):
 
             @hidet.script
             def page_attention_softmax(
-                output: f32[bs, num_heads, max_seq_length],
-                score: f32[bs, num_heads, max_seq_length],
+                max_seq_length: i32,
+                output_ptr: ~f32,
+                score_ptr: ~f32,
                 seq_lengths: i32[bs],
             ):
                 attrs.func_kind = 'cuda_kernel'
                 attrs.cuda.grid_dim = num_heads, bs
                 attrs.cuda.block_dim = 32
+
+                output = tensor_pointer(f32, [bs, num_heads, max_seq_length], init=output_ptr)
+                score = tensor_pointer(f32, [bs, num_heads, max_seq_length], init=score_ptr)
 
                 bs_idx = blockIdx.z
                 head_idx = blockIdx.y
@@ -305,10 +312,11 @@ class PageAttentionOp(OpaqueOperator):
 
             @hidet.script
             def page_attention_output(
+                max_seq_length: i32,
                 output: f16[bs, num_heads, 1, head_size],
-                score: f32[bs, num_heads, max_seq_length],
-                seq_lengths: f16[bs],
-                cache_blocks: f16[bs, max_cache_blocks],
+                score_ptr: ~f32,
+                seq_lengths: i32[bs],
+                cache_blocks: i32[bs, max_cache_blocks],
                 value_cache: f16[num_blocks, num_kv_heads, head_size, block_size],
             ):
                 attrs.func_kind = 'cuda_kernel'
@@ -318,6 +326,8 @@ class PageAttentionOp(OpaqueOperator):
                 bs_idx = blockIdx.y
                 head_idx = blockIdx.x
 
+                score = tensor_pointer(f32, [bs, num_heads, max_seq_length], init=score_ptr)
+
                 j = threadIdx.x
                 seq_length = seq_lengths[bs_idx]
 
@@ -325,7 +335,7 @@ class PageAttentionOp(OpaqueOperator):
 
                 for k in range(seq_length):
                     a = score[bs_idx, head_idx, k]
-                    block_idx = cache_blocks[k // block_size]
+                    block_idx = cache_blocks[bs_idx, k // block_size]
                     block_offset = k % block_size
                     b = value_cache[block_idx, head_idx, j, block_offset]
                     acc += a * b
@@ -335,8 +345,8 @@ class PageAttentionOp(OpaqueOperator):
             @hidet.script
             def launch(
                 query: f16[bs, num_heads, 1, head_size],
-                seq_lengths: f16[bs],
-                cache_blocks: f16[bs, max_cache_blocks],
+                seq_lengths: i32[bs],
+                cache_blocks: i32[bs, max_cache_blocks],
                 key_cache: f16[num_blocks, num_kv_heads, head_size, block_size],
                 value_cache: f16[num_blocks, num_kv_heads, head_size, block_size],
                 output: f16[bs, num_heads, 1, head_size],
@@ -345,29 +355,37 @@ class PageAttentionOp(OpaqueOperator):
 
                 # calculate max_seq_length
                 max_seq_length: i32 = 0
-                seq_lengths_cpu = runtime.request_cpu_workspace(nbytes=bs * f16.nbytes)
-                memcpy_async(dst=seq_lengths_cpu, src=seq_lengths, count=bs * f16.nbytes, kind='cuda_to_cpu')
+                seq_lengths_cpu = cast(
+                    runtime.request_cpu_workspace(nbytes=bs * i32.nbytes),
+                    dtype=tensor_pointer_type(i32, [bs])
+                )
+                memcpy_async(dst=seq_lengths_cpu, src=seq_lengths, count=bs * i32.nbytes, kind='cuda_to_cpu')
                 for i in range(bs):
                     max_seq_length = max(max_seq_length, seq_lengths_cpu[i])
                 runtime.set_symbol_value('max_seq_length', max_seq_length)
 
                 # allocate cuda buffers
-                cuda_workspace = runtime.request_cuda_workspace(
-                    nbytes=2 * bs * num_heads * max_seq_length * f32.nbytes
+                cuda_workspace = cast(
+                    runtime.request_cuda_workspace(nbytes=2 * bs * num_heads * max_seq_length * f32.nbytes),
+                    dtype=~u8
                 )
-                score = cast(~cuda_workspace[0], dtype=f32[bs, num_heads, max_seq_length])
+                score = cast(
+                    ~cuda_workspace[0],
+                    dtype=tensor_pointer_type(f32, [bs, num_heads, max_seq_length])
+                )
                 softmax = cast(
-                    ~cuda_workspace[bs * num_heads * max_seq_length], dtype=f32[bs, num_heads, max_seq_length]
+                    ~cuda_workspace[bs * num_heads * max_seq_length],
+                    dtype=tensor_pointer_type(f32, [bs, num_heads, max_seq_length])
                 )
 
                 # score = query @ key
-                page_attention_score(score, query, seq_lengths, cache_blocks, key_cache)
+                page_attention_score(max_seq_length, score, query, seq_lengths, cache_blocks, key_cache)
 
                 # softmax(score)
-                page_attention_softmax(softmax, score)
+                page_attention_softmax(max_seq_length, softmax, score, seq_lengths)
 
                 # output = softmax @ value
-                page_attention_output(output, softmax, seq_lengths, cache_blocks, value_cache)
+                page_attention_output(max_seq_length, output, softmax, seq_lengths, cache_blocks, value_cache)
 
         return script_module.ir_module()
 

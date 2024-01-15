@@ -2,7 +2,7 @@
 Builds a LLM app.
 """
 from typing import Optional, Type, List
-from transformers import PretrainedConfig, AutoConfig
+from transformers import PretrainedConfig, AutoConfig, AutoTokenizer
 import hidet.option
 from hidet.ir.dtypes import int32, int64, DataType
 from hidet.graph import FlowGraph
@@ -75,8 +75,10 @@ def _build_prefill_graph(
     outputs: List[Tensor] = [hidden_states, *key_caches, *value_caches]
     graph: FlowGraph = hidet.trace_from(outputs, inputs=inputs)
 
-    # optimize the flow graph
-    graph: FlowGraph = hidet.graph.optimize(graph)
+    # # optimize the flow graph
+    # graph: FlowGraph = hidet.graph.optimize(graph)
+    with open('./prefill_graph.json', 'w') as f:
+        hidet.utils.netron.dump(graph, f)
 
     # build the flow graph into a CompiledGraph
     compiled_graph = graph.build(space=kernel_search_space)
@@ -97,7 +99,7 @@ def _build_decode_graph(
     # create the input tensors
     input_ids: Tensor = symbol(['bs', 1], dtype=int32, device=device)
     position_ids: Tensor = symbol(['bs', 1], dtype=int32, device=device)
-    cache_slots: Tensor = symbol(['bs', 1], dtype=int64, device=device)
+    cache_slots: Tensor = symbol(['bs', 'seq'], dtype=int64, device=device)
     seq_lengths: Tensor = symbol(['bs'], dtype=int32, device=device)
     max_context_length: Tensor = symbol([], dtype=int32, device=device)
     cache_blocks: Tensor = symbol(['bs', 'cache_blocks'], dtype=int32, device=device)
@@ -135,8 +137,10 @@ def _build_decode_graph(
     outputs: List[Tensor] = [hidden_states, *key_caches, *value_caches]
     graph: FlowGraph = hidet.trace_from(outputs, inputs=inputs)
 
-    # optimize the flow graph
-    graph: FlowGraph = hidet.graph.optimize(graph)
+    # # optimize the flow graph
+    # graph: FlowGraph = hidet.graph.optimize(graph)
+    with open('./decode_graph.json', 'w') as f:
+        hidet.utils.netron.dump(graph, f)
 
     # build the flow graph into a CompiledGraph
     compiled_graph = graph.build(space=kernel_search_space)
@@ -199,11 +203,13 @@ def create_llm(
     model: PretrainedModelForCausalLM = model_class.from_pretrained(name, device=device, dtype=dtype, revision=revision)
 
     # build the prefill graph
+    print('build prefill graph')
     prefill_graph = _build_prefill_graph(
         model, device=device, block_size=block_size, kernel_search_space=kernel_search_space
     )
 
     # build the decode graph
+    print('build decode graph')
     decode_graph = _build_decode_graph(
         model, device=device, block_size=block_size, kernel_search_space=kernel_search_space
     )
@@ -214,12 +220,12 @@ def create_llm(
             modules={},
             tensors={'embedding': model.embedding()},  # [hidden_size, vocab_size]
             attributes={
-                'cache_dtype': dtype,
+                'cache_dtype': model.dtype().name,
                 'num_layers': model.num_attention_layers(),
                 'num_heads': model.num_attention_heads(),
                 'head_size': model.attention_head_size(),
                 'block_size': block_size,
-                'tokenizer': config.tokenizer if tokenizer is None else tokenizer,
+                'tokenizer': tokenizer if tokenizer is not None else name,
             },
             name='llm',
         ),

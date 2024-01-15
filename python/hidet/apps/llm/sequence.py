@@ -5,6 +5,7 @@ from .cache import CacheTableManager, BlockDevice
 
 
 class SequenceState(Enum):
+    NEW = 'new'
     WAITING = 'waiting'
     RUNNING = 'running'
     FINISHED_STOPPED = 'finished_stopped'
@@ -20,7 +21,7 @@ class Sequence:
         self.prompt_tokens: List[int] = []
         self.output_tokens: List[int] = []
         self.blocks: List[int] = []
-        self.status: SequenceState = SequenceState.WAITING
+        self.status: SequenceState = SequenceState.NEW
 
     def append_token(self, token: int):
         self.output_tokens.append(token)
@@ -30,8 +31,6 @@ class Sequence:
             self.status = SequenceState.FINISHED_STOPPED
         elif len(self.output_tokens) >= self.sampling_params.max_tokens:
             self.status = SequenceState.FINISHED_LENGTH
-        else:
-            self.status = SequenceState.RUNNING
 
     def is_finished(self) -> bool:
         return self.status in [SequenceState.FINISHED_STOPPED, SequenceState.FINISHED_LENGTH]
@@ -61,33 +60,96 @@ class SequenceOutput:
 class SequenceScheduler:
     def __init__(self, cache: CacheTableManager):
         self.cache: CacheTableManager = cache
+        self.new: List[Sequence] = []
         self.waiting: List[Sequence] = []
         self.running: List[Sequence] = []
+        self.swapped: List[Sequence] = []
+        self.block_size: int = self.cache.block_size
 
     def add_sequence(self, sequence: Sequence):
-        self.waiting.append(sequence)
-
-        # allocate virtual blocks for the sequence
-        num_blocks: int = (len(sequence.prompt_tokens) + self.cache.block_size - 1) // self.cache.block_size
-        sequence.blocks.extend(self.cache.alloc_virtual_blocks(num_blocks))
+        self.new.append(sequence)
 
     def schedule(self) -> List[Sequence]:
-        # current strategy: put all waiting requests into running list, and raise an error if there is not enough blocks
-        # todo: implement swapping strategy
-        while len(self.waiting) > 0:
-            seq = self.waiting.pop()
+        """
+        Schedule the sequences to run in the next step.
 
-            # all virtual blocks are not mapped to physical blocks yet, allocate gpu blocks for them
-            gpu_blocks: List[int] = self.cache.alloc_gpu_blocks(len(seq.blocks))
+        Current strategy:
+        1. if there are new requests, and there are enough free blocks
+           1) put all the running sequences to waiting list
+           2) allocate virtual and gpu blocks for the new sequences (allocate for as many as possible sequences)
+           3) put the new sequences to running list
+        2. if there are enough free blocks for the waiting and running sequences for the next token
+           1) allocate block for all sequences that have no slots left
+           2) put all the sequences in running and waiting list to the running list
+        3. evict the sequences that arrived at the late time to swapped list
+           1) sort the sequences in waiting and running list by the sequence id
+           2) evict the sequences that arrived at the late time to swapped list, and free the gpu blocks
+           3) put the remaining sequences to running list
+        """
 
-            # map virtual blocks to gpu blocks
-            for vir_block, gpu_block in zip(seq.blocks, gpu_blocks):
-                self.cache.map_block(vir_block, BlockDevice.GPU, gpu_block)
+        # case 1
+        if self.new:
+            num_free_blocks: int = self.cache.gpu_cache.num_free_blocks()
+            allocated_blocks: int = 0
+            to_add: List[Sequence] = []
+            for seq in self.new:
+                require_blocks = len(seq.prompt_tokens) // self.block_size + 1
+                if allocated_blocks + require_blocks <= num_free_blocks:
+                    to_add.append(seq)
+                    allocated_blocks += require_blocks
+                else:
+                    break
+            if to_add:
+                while self.running:
+                    seq = self.running.pop()
+                    seq.status = SequenceState.WAITING
+                    self.waiting.append(seq)
+                while to_add:
+                    seq = to_add.pop()
+                    seq.status = SequenceState.RUNNING
+                    self.running.append(seq)
+                self.new = self.new[len(self.running):]
+                # allocate blocks
+                virtual_blocks = self.cache.alloc_virtual_blocks(allocated_blocks)
+                gpu_blocks = self.cache.alloc_gpu_blocks(allocated_blocks)
+                for seq in self.running:
+                    require_blocks = len(seq.prompt_tokens) // self.block_size + 1
+                    while require_blocks > 0:
+                        virtual_block = virtual_blocks.pop()
+                        gpu_block = gpu_blocks.pop()
+                        seq.blocks.append(virtual_block)
+                        self.cache.map_block(virtual_block, BlockDevice.GPU, gpu_block)
+                        require_blocks -= 1
+                return self.running
 
-            # add the sequence to running list
-            self.running.append(seq)
+        # case 2
+        if len(self.running) + len(self.waiting) > 0:
+            num_free_blocks: int = self.cache.gpu_cache.num_free_blocks()
+            seqs_require_new_block: List[Sequence] = []
+            for seq in self.running + self.waiting:
+                if ((len(seq.prompt_tokens) + len(seq.output_tokens)) % self.block_size) == 0:
+                    seqs_require_new_block.append(seq)
+            if len(seqs_require_new_block) <= num_free_blocks:
+                virtual_blocks = self.cache.alloc_virtual_blocks(len(seqs_require_new_block))
+                gpu_blocks = self.cache.alloc_gpu_blocks(len(seqs_require_new_block))
+                for seq, virtual_block, gpu_block in zip(seqs_require_new_block, virtual_blocks, gpu_blocks):
+                    seq.blocks.append(virtual_block)
+                    self.cache.map_block(virtual_block, BlockDevice.GPU, gpu_block)
+                while self.waiting:
+                    seq = self.waiting.pop()
+                    seq.status = SequenceState.RUNNING
+                    self.running.append(seq)
+                return self.running
+        # case 3
+        raise NotImplementedError('case 3 not implemented yet')
 
-        return self.running
+    def post_running_update(self):
+        for sequence in self.running:
+            if sequence.is_finished():
+                # free the virtual and gpu blocks
+                gpu_blocks = self.cache.get_mapped_blocks(sequence.blocks)
+                self.cache.unmap_blocks(sequence.blocks)
+                self.cache.free_gpu_blocks(gpu_blocks)
+                self.cache.free_virtual_blocks(sequence.blocks)
 
-    def update(self):
         self.running = [sequence for sequence in self.running if not sequence.is_finished()]

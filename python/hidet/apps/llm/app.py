@@ -102,7 +102,7 @@ class LLM:
             block_size = self.cache.block_size
             slots = []
             for i in range(len(seq.prompt_tokens)):
-                virtual_block: int = seq.blocks[i]
+                virtual_block: int = seq.blocks[i // block_size]
                 gpu_block: int = self.cache.mapping[virtual_block][1]
                 slot: int = gpu_block * block_size + i % block_size
                 slots.append(slot)
@@ -156,8 +156,8 @@ class LLM:
         max_context_length: Tensor = tensor(max_context_length)
         cache_blocks: Tensor = tensor_pad(cache_blocks)
 
-        # run the prefill graph
-        prefill_graph = self.compiled_app.graphs['prefill']
+        # run the decode graph
+        decode_graph = self.compiled_app.graphs['decode']
         inputs = [
             input_ids,
             position_ids,
@@ -167,8 +167,8 @@ class LLM:
             cache_blocks,
             *self.cache_inputs,
         ]
-        outputs: List[Tensor] = prefill_graph.run_async(inputs)
-        hidden_states: Tensor = outputs[0]  # [bs, seq_len, hidden_size]
+        outputs: List[Tensor] = decode_graph.run_async(inputs)
+        hidden_states: Tensor = outputs[0]  # [bs, 1, hidden_size]
 
         return hidden_states
 
@@ -188,20 +188,18 @@ class LLM:
                 )
             )
 
-            if sequence.is_finished():
-                # free the virtual and gpu blocks
-                gpu_blocks = self.cache.get_mapped_blocks(sequence.blocks)
-                self.cache.unmap_blocks(sequence.blocks)
-                self.cache.free_gpu_blocks(gpu_blocks)
-                self.cache.free_virtual_blocks(sequence.blocks)
-
         # update the scheduler status (e.g., some sequences may be finished)
-        self.scheduler.update()
+        self.scheduler.post_running_update()
 
         return sequence_outputs
 
     def add_sequence(self, sequence_id: int, prompt: str, sampling_params: SamplingParams):
-        self.scheduler.add_sequence(Sequence(sequence_id, prompt, sampling_params))
+        seq = Sequence(sequence_id, prompt, sampling_params)
+
+        # tokenize the prompt
+        seq.prompt_tokens = self.tokenizer.encode(seq.prompt)
+
+        self.scheduler.add_sequence(seq)
 
     def step(self) -> List[SequenceOutput]:
         # schedule for the next step, got the sequences to run
