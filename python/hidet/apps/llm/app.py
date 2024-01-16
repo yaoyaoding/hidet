@@ -137,13 +137,11 @@ class LLM:
             position_ids_list.append([num_tokens - 1])
 
             block_size = self.cache.block_size
-            slots = []
-            for i in range(num_tokens):
-                virtual_block: int = seq.blocks[i // block_size]
-                gpu_block: int = self.cache.mapping[virtual_block][1]
-                slot: int = gpu_block * block_size + i % block_size
-                slots.append(slot)
-            cache_slots_list.append(slots)
+            last_token = num_tokens - 1
+            virtual_block: int = seq.blocks[last_token // block_size]
+            gpu_block: int = self.cache.mapping[virtual_block][1]
+            slot: int = gpu_block * block_size + last_token % block_size
+            cache_slots_list.append([slot])
             seq_lengths_list.append(num_tokens)
             cache_blocks.append([self.cache.mapping[virtual_block][1] for virtual_block in seq.blocks])
             max_context_length = max(max_context_length, num_tokens)
@@ -151,7 +149,7 @@ class LLM:
         # convert them into hidet tensors
         input_ids: Tensor = tensor_pad(input_ids_list)
         position_ids: Tensor = tensor_pad(position_ids_list)
-        cache_slots: Tensor = tensor_pad(cache_slots_list, pad_value=-1, dtype='int64')
+        cache_slots: Tensor = tensor_pad(cache_slots_list, dtype='int64')
         seq_lengths: Tensor = tensor(seq_lengths_list)
         max_context_length: Tensor = tensor(max_context_length)
         cache_blocks: Tensor = tensor_pad(cache_blocks)

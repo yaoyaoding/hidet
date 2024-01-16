@@ -9,15 +9,7 @@ from hidet.ir.library import tune
 
 
 class PageAttentionWriteCacheOp(OpaqueOperator):
-    def __init__(
-        self,
-        seq_lengths,
-        key,
-        value,
-        cache_slots,
-        key_cache,
-        value_cache,
-    ):
+    def __init__(self, seq_lengths, key, value, cache_slots, key_cache, value_cache):
         # seq_lengths: [bs]
         #   key: [bs, num_kv_heads, max_seq_length, head_size]
         # value: [bs, num_kv_heads, max_seq_length, head_size]
@@ -25,7 +17,7 @@ class PageAttentionWriteCacheOp(OpaqueOperator):
         # key_cache: [num_blocks, num_kv_heads, head_size, block_size]
         # value_cache: [num_blocks, num_kv_heads, head_size, block_size]
         super().__init__(
-            name='page_attention_write_cache',
+            name='cache_write',
             inputs={
                 'seq_lengths': seq_lengths,
                 'key': key,
@@ -33,14 +25,12 @@ class PageAttentionWriteCacheOp(OpaqueOperator):
                 'cache_slots': cache_slots,
                 'key_cache': key_cache,
                 'value_cache': value_cache,
-            }
+            },
+            share_map={0: 4, 1: 5},  # share key_cache and value_cache
         )
 
     def symbolic_forward(self, seq_lengths, key, value, cache_slots, key_cache, value_cache):
-        return {
-            'key_cache_out': key_cache,
-            'value_cache_out': value_cache
-        }
+        return {'key_cache_out': key_cache, 'value_cache_out': value_cache}
 
     def implement_cuda(self, inputs: List[Tensor], outputs: List[Tensor]) -> Union[IRModule, List[IRModule]]:
         return tune.extract_ir_modules(self.schedule_cuda)
@@ -48,9 +38,10 @@ class PageAttentionWriteCacheOp(OpaqueOperator):
     @tune.space(1)  # empty space
     def schedule_cuda(self):
         import hidet
-        from hidet.lang import attrs
-        from hidet.lang.types import i32, f16, i64, shared_tensor
+        from hidet.lang import attrs, printf
+        from hidet.lang.types import i32, f16, f32, i64, shared_tensor
         from hidet.lang.cuda import blockIdx, threadIdx, blockDim, syncthreads
+        from hidet.lang.mapping import spatial
 
         bs, num_kv_heads, max_seq_length, head_size = self.inputs[1].shape
         num_blocks, num_kv_heads, head_size, block_size = self.inputs[4].shape
@@ -67,13 +58,12 @@ class PageAttentionWriteCacheOp(OpaqueOperator):
                 inp: f16[bs, num_kv_heads, max_seq_length, head_size],
                 cache_slots: i64[bs, max_seq_length],
                 cache: f16[num_blocks, num_kv_heads, head_size, block_size],
-                buf: f16[seq_tile, dim_tile * 4 + 1]
+                buf: f16[seq_tile, dim_tile * 4 + 1],
             ):
                 attrs.func_kind = 'cuda_internal'
 
                 bs_idx = blockIdx.x
                 kv_head_idx = blockIdx.y
-                tid = threadIdx.x
                 seq_length = seq_lengths[bs_idx]
 
                 for t in range((seq_length + seq_tile - 1) // seq_tile):
@@ -81,40 +71,45 @@ class PageAttentionWriteCacheOp(OpaqueOperator):
                         # do not need to check boundary
                         for j in range(head_size // (dim_tile * 4)):
                             # read to buf [seq_tile, dim_tile * 4]
-                            ii, jj = tid / dim_tile, tid % dim_tile
-                            i = t * seq_tile + ii
-                            for k in range(4):
-                                buf[ii, jj * 4 + k] = inp[bs_idx, kv_head_idx, i, jj * 4 + k]
+                            for i, jj in spatial(seq_tile, dim_tile).on(threadIdx.x):
+                                for jjj in range(4):
+                                    seq_idx = t * seq_tile + i
+                                    dim_idx = j * (dim_tile * 4) + jj * 4 + jjj
+                                    buf[i, jj * 4 + jjj] = inp[bs_idx, kv_head_idx, seq_idx, dim_idx]
                             syncthreads()
 
                             # write buf to cache in global memory
-                            ii, jj = tid % seq_tile, tid // seq_tile
-                            i = t * seq_tile + ii
-                            cache_slot = cache_slots[bs_idx, i]
-                            block_idx = cache_slot // block_size
-                            block_offset = cache_slot % block_size
-                            for k in range(4):
-                                cache[block_idx, kv_head_idx, jj * 4 + k, block_offset] = buf[ii, jj * 4 + k]
+                            for jj, ii in spatial(dim_tile, seq_tile).on(threadIdx.x):
+                                seq_idx = t * seq_tile + ii
+                                cache_slot = cache_slots[bs_idx, seq_idx]
+                                block_idx = i32(cache_slot // block_size)
+                                block_offset = i32(cache_slot % block_size)
+                                for jjj in range(4):
+                                    dim_idx = j * dim_tile * 4 + jj * 4 + jjj
+                                    cache[block_idx, kv_head_idx, dim_idx, block_offset] = buf[ii, jj * 4 + jjj]
                             syncthreads()
                     else:
+                        # do not need to check boundary
                         for j in range(head_size // (dim_tile * 4)):
                             # read to buf [seq_tile, dim_tile * 4]
-                            ii, jj = tid / dim_tile, tid % dim_tile
-                            i = t * seq_tile + ii
-                            if i < seq_length:
-                                for k in range(4):
-                                    buf[ii, jj * 4 + k] = inp[bs_idx, kv_head_idx, i, jj * 4 + k]
+                            for i, jj in spatial(seq_tile, dim_tile).on(threadIdx.x):
+                                for jjj in range(4):
+                                    seq_idx = t * seq_tile + i
+                                    dim_idx = j * (dim_tile * 4) + jj * 4 + jjj
+                                    if seq_idx < seq_length:
+                                        buf[i, jj * 4 + jjj] = inp[bs_idx, kv_head_idx, seq_idx, dim_idx]
                             syncthreads()
 
                             # write buf to cache in global memory
-                            ii, jj = tid % seq_tile, tid // seq_tile
-                            i = t * seq_tile + ii
-                            cache_slot = cache_slots[bs_idx, i]
-                            block_idx = cache_slot // block_size
-                            block_offset = cache_slot % block_size
-                            if i < seq_length:
-                                for k in range(4):
-                                    cache[block_idx, kv_head_idx, jj * 4 + k, block_offset] = buf[ii, jj * 4 + k]
+                            for jj, ii in spatial(dim_tile, seq_tile).on(threadIdx.x):
+                                seq_idx = t * seq_tile + ii
+                                if seq_idx < seq_length:
+                                    cache_slot = cache_slots[bs_idx, seq_idx]
+                                    block_idx = i32(cache_slot // block_size)
+                                    block_offset = i32(cache_slot % block_size)
+                                    for jjj in range(4):
+                                        dim_idx = j * dim_tile * 4 + jj * 4 + jjj
+                                        cache[block_idx, kv_head_idx, dim_idx, block_offset] = buf[ii, jj * 4 + jjj]
                             syncthreads()
 
             @hidet.script
@@ -203,9 +198,7 @@ class PageAttentionOp(OpaqueOperator):
         assert query.dtype == key_cache.dtype == value_cache.dtype, 'Mismatched dtype of query, key, value'
         assert query.dtype in [float16], f'Unsupported dtype: {query.dtype}'
         bs, num_heads, _, head_size = query.shape
-        return {
-            'output': self.symbol(shape=[bs, num_heads, 1, head_size], dtype=query.dtype, device=query.device),
-        }
+        return {'output': self.symbol(shape=[bs, num_heads, 1, head_size], dtype=query.dtype, device=query.device)}
 
     def implement_cuda(self, inputs: List[Tensor], outputs: List[Tensor]) -> Union[IRModule, List[IRModule]]:
         return tune.extract_ir_modules(self.schedule_cuda)
@@ -214,10 +207,10 @@ class PageAttentionOp(OpaqueOperator):
     def schedule_cuda(self) -> IRModule:
         # naive implementation, todo: optimize this kernel
         import hidet
-        from hidet.lang import attrs, cast
+        from hidet.lang import attrs, cast, printf
         from hidet.lang.types import u8, f16, f32, i32, register_tensor, tensor_pointer_type, tensor_pointer
-        from hidet.lang.cuda import memcpy_async, blockIdx, threadIdx, shfl_down_sync, shfl_sync, blockDim
-        from hidet.ir.primitives.math import exp
+        from hidet.lang.cuda import memcpy, blockIdx, threadIdx, shfl_down_sync, shfl_sync, blockDim
+        from hidet.ir.primitives.math import exp, sqrt
         from hidet.ir.primitives import runtime
 
         _query, _seq_lengths, _cache_blocks, _key_cache, _value_cache = self.inputs
@@ -229,6 +222,7 @@ class PageAttentionOp(OpaqueOperator):
 
         assert int(32 % block_size) == 0
         with hidet.script_module() as script_module:
+
             @hidet.script
             def page_attention_score(
                 max_seq_length: i32,
@@ -259,23 +253,27 @@ class PageAttentionOp(OpaqueOperator):
                         a = query[bs_idx, head_idx, k]
                         b = key_cache[block_idx, kv_head_idx, k, block_offset]
                         acc += a * b
+                    acc = acc / sqrt(cast(head_size, f32))
                     score[bs_idx, head_idx, j] = acc
 
             @hidet.script
             def warp_max(val: f32) -> f32:
                 attrs.func_kind = 'cuda_internal'
-                for i in range(4):
-                    val = max(val, shfl_down_sync(0xffffffff, val, 1 << i))
-                val = shfl_sync(0xffffffff, val, 0)
+                for i in range(5):
+                    val = max(val, shfl_down_sync(0xFFFFFFFF, val, 1 << i))
+                val = shfl_sync(0xFFFFFFFF, val, 0)
                 return val
 
             @hidet.script
-            def page_attention_softmax(
-                max_seq_length: i32,
-                output_ptr: ~f32,
-                score_ptr: ~f32,
-                seq_lengths: i32[bs],
-            ):
+            def warp_sum(val: f32) -> f32:
+                attrs.func_kind = 'cuda_internal'
+                for i in range(5):
+                    val = val + shfl_down_sync(0xFFFFFFFF, val, 1 << i)
+                val = shfl_sync(0xFFFFFFFF, val, 0)
+                return val
+
+            @hidet.script
+            def page_attention_softmax(max_seq_length: i32, output_ptr: ~f32, score_ptr: ~f32, seq_lengths: i32[bs]):
                 attrs.func_kind = 'cuda_kernel'
                 attrs.cuda.grid_dim = num_heads, bs
                 attrs.cuda.block_dim = 32
@@ -283,14 +281,15 @@ class PageAttentionOp(OpaqueOperator):
                 output = tensor_pointer(f32, [bs, num_heads, max_seq_length], init=output_ptr)
                 score = tensor_pointer(f32, [bs, num_heads, max_seq_length], init=score_ptr)
 
-                bs_idx = blockIdx.z
-                head_idx = blockIdx.y
+                bs_idx = blockIdx.y
+                head_idx = blockIdx.x
 
                 seq_length = seq_lengths[bs_idx]
+                warp_size = 32
 
                 # max value
                 max_val = f32.min_value
-                for i in range((seq_length + 1) / blockDim.x):
+                for i in range((seq_length + warp_size - 1) / warp_size):
                     j = i * blockDim.x + threadIdx.x
                     if j < seq_length:
                         max_val = max(max_val, score[bs_idx, head_idx, j])
@@ -298,14 +297,14 @@ class PageAttentionOp(OpaqueOperator):
 
                 # sum exp
                 sum_exp = f32.zero
-                for i in range((seq_length + 1) / blockDim.x):
+                for i in range((seq_length + warp_size - 1) / warp_size):
                     j = i * blockDim.x + threadIdx.x
                     if j < seq_length:
                         sum_exp += exp(score[bs_idx, head_idx, j] - max_val)
-                sum_exp = warp_max(sum_exp)
+                sum_exp = warp_sum(sum_exp)
 
                 # divide
-                for i in range((seq_length + 1) / blockDim.x):
+                for i in range((seq_length + warp_size - 1) / warp_size):
                     j = i * blockDim.x + threadIdx.x
                     if j < seq_length:
                         output[bs_idx, head_idx, j] = exp(score[bs_idx, head_idx, j] - max_val) / sum_exp
@@ -325,6 +324,7 @@ class PageAttentionOp(OpaqueOperator):
 
                 bs_idx = blockIdx.y
                 head_idx = blockIdx.x
+                kv_head_idx = head_idx % num_kv_heads
 
                 score = tensor_pointer(f32, [bs, num_heads, max_seq_length], init=score_ptr)
 
@@ -337,7 +337,7 @@ class PageAttentionOp(OpaqueOperator):
                     a = score[bs_idx, head_idx, k]
                     block_idx = cache_blocks[bs_idx, k // block_size]
                     block_offset = k % block_size
-                    b = value_cache[block_idx, head_idx, j, block_offset]
+                    b = value_cache[block_idx, kv_head_idx, j, block_offset]
                     acc += a * b
 
                 output[bs_idx, head_idx, 0, j] = cast(acc, f16)
@@ -356,29 +356,23 @@ class PageAttentionOp(OpaqueOperator):
                 # calculate max_seq_length
                 max_seq_length: i32 = 0
                 seq_lengths_cpu = cast(
-                    runtime.request_cpu_workspace(nbytes=bs * i32.nbytes),
-                    dtype=tensor_pointer_type(i32, [bs])
+                    runtime.request_cpu_workspace(nbytes=bs * i32.nbytes), dtype=tensor_pointer_type(i32, [bs])
                 )
-                memcpy_async(dst=seq_lengths_cpu, src=seq_lengths, count=bs * i32.nbytes, kind='cuda_to_cpu')
+                memcpy(dst=seq_lengths_cpu, src=seq_lengths, count=bs * i32.nbytes, kind='cuda_to_cpu')
                 for i in range(bs):
                     max_seq_length = max(max_seq_length, seq_lengths_cpu[i])
-                runtime.set_symbol_value('max_seq_length', max_seq_length)
 
                 # allocate cuda buffers
                 cuda_workspace = cast(
-                    runtime.request_cuda_workspace(nbytes=2 * bs * num_heads * max_seq_length * f32.nbytes),
-                    dtype=~u8
+                    runtime.request_cuda_workspace(nbytes=2 * bs * num_heads * max_seq_length * f32.nbytes), dtype=~u8
                 )
-                score = cast(
-                    ~cuda_workspace[0],
-                    dtype=tensor_pointer_type(f32, [bs, num_heads, max_seq_length])
-                )
+                score = cast(~cuda_workspace[0], dtype=tensor_pointer_type(f32, [bs, num_heads, max_seq_length]))
                 softmax = cast(
-                    ~cuda_workspace[bs * num_heads * max_seq_length],
-                    dtype=tensor_pointer_type(f32, [bs, num_heads, max_seq_length])
+                    ~cuda_workspace[bs * num_heads * max_seq_length * f32.nbytes],
+                    dtype=tensor_pointer_type(f32, [bs, num_heads, max_seq_length]),
                 )
 
-                # score = query @ key
+                # score = query @ key / sqrt(head_size)
                 page_attention_score(max_seq_length, score, query, seq_lengths, cache_blocks, key_cache)
 
                 # softmax(score)
@@ -391,12 +385,7 @@ class PageAttentionOp(OpaqueOperator):
 
 
 def cache_write(
-    seq_lengths: Tensor,
-    key: Tensor,
-    value: Tensor,
-    cache_slots: Tensor,
-    key_cache: Tensor,
-    value_cache: Tensor,
+    seq_lengths: Tensor, key: Tensor, value: Tensor, cache_slots: Tensor, key_cache: Tensor, value_cache: Tensor
 ) -> Tuple[Tensor, Tensor]:
     """
     Write the key and value to the cache.
@@ -404,13 +393,13 @@ def cache_write(
     Parameters
     ----------
     seq_lengths: Tensor
-        The sequence lengths. Shape: [bs]
+        The sequence lengths. Shape: i32 [bs]
     key: Tensor
         The key tensor. Shape: [bs, num_kv_heads, max_seq_length, head_size]
     value: Tensor
         The value tensor. Shape: [bs, num_kv_heads, max_seq_length, head_size]
     cache_slots: Tensor
-        The cache slots. Shape: [bs, max_seq_length]
+        The cache slots. Shape: i64 [bs, max_seq_length]
     key_cache: Tensor
         The key cache. Shape: [num_blocks, num_kv_heads, head_size, block_size]
     value_cache: Tensor

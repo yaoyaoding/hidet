@@ -86,6 +86,8 @@ class SequenceScheduler:
            2) evict the sequences that arrived at the late time to swapped list, and free the gpu blocks
            3) put the remaining sequences to running list
         """
+        if not self.new and not self.waiting and not self.running:
+            return []
 
         # case 1
         if self.new:
@@ -108,7 +110,7 @@ class SequenceScheduler:
                     seq = to_add.pop()
                     seq.status = SequenceState.RUNNING
                     self.running.append(seq)
-                self.new = self.new[len(self.running):]
+                self.new = self.new[len(self.running) :]
                 # allocate blocks
                 virtual_blocks = self.cache.alloc_virtual_blocks(allocated_blocks)
                 gpu_blocks = self.cache.alloc_gpu_blocks(allocated_blocks)

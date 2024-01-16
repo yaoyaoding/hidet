@@ -71,7 +71,7 @@ class PretrainedModelForCausalLM(nn.Module):
         return NotImplementedError()
 
     def embedding(self) -> Tensor:
-        # with shape [vocab_size, hidden_size]
+        # with shape [hidden_size, vocab_size]
         raise NotImplementedError()
 
     def dtype(self) -> DataType:

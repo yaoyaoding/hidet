@@ -72,11 +72,12 @@ class CompiledFunction:
         status = get_last_error()
         if status is not None:
             from hidet.graph.tensor import Tensor
+
             args_str = ', '.join([arg.signature() if isinstance(arg, Tensor) else str(arg) for arg in args])
             msg = (
-                'Calling {} with arguments ({}) failed. error:\n'.format(self.name, args_str) +
-                '{}\n'.format(status) +
-                'Function @ {}'.format(self.lib_path)
+                'Calling {} with arguments ({}) failed. error:\n'.format(self.name, args_str)
+                + '{}\n'.format(status)
+                + 'Function @ {}'.format(self.lib_path)
             )
             raise BackendException(msg)
 

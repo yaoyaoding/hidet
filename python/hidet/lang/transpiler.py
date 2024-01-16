@@ -635,7 +635,7 @@ class PythonToHidetTranslator(PythonAstFunctor):
                 BitAnd: operator.and_,
                 Pow: primitives.pow,
                 LShift: ir.expr.left_shift,
-                RShift: ir.expr.right_shift
+                RShift: ir.expr.right_shift,
             }
 
             if type(expr.op) in op_dict:

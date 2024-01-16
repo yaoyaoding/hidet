@@ -29,3 +29,18 @@ def memcpy_async(dst: Expr, src: Expr, count: Expr, kind: str):
     return BlackBoxStmt(
         'cudaMemcpyAsync({}, {}, {}, {}, (cudaStream_t){});'.format(dst, src, count, kind_map[kind], get_cuda_stream())
     )
+
+
+def memcpy(dst: Expr, src: Expr, count: Expr, kind: str):
+
+    kind_map = {
+        'cpu_to_cpu': 'cudaMemcpyHostToHost',
+        'cpu_to_cuda': 'cudaMemcpyHostToDevice',
+        'cuda_to_cpu': 'cudaMemcpyDeviceToHost',
+        'cuda_to_cuda': 'cudaMemcpyDeviceToDevice',
+    }
+
+    if kind not in kind_map:
+        raise RuntimeError(f'Unsupported transfer from {src} to {dst}, candidate kinds are {list(kind_map.keys())}')
+
+    return BlackBoxStmt('cudaMemcpy({}, {}, {}, {});'.format(dst, src, count, kind_map[kind]))

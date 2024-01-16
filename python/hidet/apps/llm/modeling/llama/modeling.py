@@ -68,10 +68,7 @@ class LlamaRotaryEmbedding(nn.Module):
         #     self.cos_cached[:, :, :seq_len, ...].to(dtype=x.dtype),
         #     self.sin_cached[:, :, :seq_len, ...].to(dtype=x.dtype),
         # )
-        return (
-            self.cos_cached.to(dtype=x.dtype),
-            self.sin_cached.to(dtype=x.dtype),
-        )
+        return (self.cos_cached.to(dtype=x.dtype), self.sin_cached.to(dtype=x.dtype))
 
 
 def rotate_half(x):

@@ -1,4 +1,5 @@
 from typing import Tuple, List, Dict, Optional
+import hidet.cuda
 from hidet.ir.type import data_type, DataType
 from hidet.graph.tensor import Tensor, empty
 from hidet.runtime.storage import current_memory_pool, MemoryPool
@@ -98,22 +99,14 @@ class CacheTableManager:
         # {virtual_block_number: (block_device, physical_block_number)}
         self.mapping: Dict[int, Tuple[int, int]] = {}
 
-    def _capacity(
-        self,
-        capacity: Optional[int],
-        percentage: float = 0.9
-    ) -> int:
+    def _capacity(self, capacity: Optional[int], percentage: float = 0.9) -> int:
         if capacity is None:
             # clear the reserved memory in the current memory pool
             current_memory_pool('cuda').clear()
 
             # query the available memory
-            import hidet.cuda
             free, total = hidet.cuda.memory_info()
-            free = int(free * percentage)
-
-            size_per_layer = self.num_heads * self.head_size * self.block_size * self.dtype.nbytes
-            capacity = free // size_per_layer // 2  # 2 for key and value
+            capacity = int(free * percentage)
 
         return capacity
 

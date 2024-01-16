@@ -64,7 +64,7 @@ def _build_prefill_graph(
             seq_lengths=seq_lengths,
             key_cache=key_cache,
             value_cache=value_cache,
-            cache_slots=cache_slots
+            cache_slots=cache_slots,
         )
         for key_cache, value_cache in zip(key_caches, value_caches)
     ]
@@ -118,8 +118,9 @@ def _build_decode_graph(
             key_cache=key_cache,
             value_cache=value_cache,
             cache_slots=cache_slots,
-            cache_blocks=cache_blocks
-        ) for key_cache, value_cache in zip(key_caches, value_caches)
+            cache_blocks=cache_blocks,
+        )
+        for key_cache, value_cache in zip(key_caches, value_caches)
     ]
     hidden_states = model.forward(input_ids=input_ids, position_ids=position_ids, attn_states=attn_states)
 
@@ -214,6 +215,7 @@ def create_llm(
         model, device=device, block_size=block_size, kernel_search_space=kernel_search_space
     )
 
+    print('finish building graphs')
     return LLM(
         compiled_app=create_compiled_app(
             graphs={'prefill': prefill_graph, 'decode': decode_graph},
