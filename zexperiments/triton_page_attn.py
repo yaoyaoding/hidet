@@ -58,8 +58,13 @@ from triton.ops.matmul import _matmul
 @triton.autotune(
     configs=[
         triton.Config({}, num_stages=3, num_warps=8),
-        triton.Config({}, num_stages=4, num_warps=4),
-        triton.Config({}, num_stages=5, num_warps=2),
+        # triton.Config({}, num_stages=4, num_warps=4),
+        # triton.Config({}, num_stages=3, num_warps=4),
+        # triton.Config({}, num_stages=2, num_warps=4),
+        # triton.Config({}, num_stages=5, num_warps=2),
+        # triton.Config({}, num_stages=4, num_warps=2),
+        # triton.Config({}, num_stages=3, num_warps=2),
+        # triton.Config({}, num_stages=2, num_warps=2),
     ],
     key=['num_heads', 'head_size', 'block_size'],
 )
@@ -115,14 +120,17 @@ def page_attn_kernel(
 
 @triton.autotune(
     configs=[
-        triton.Config({'q_block_size': 16}, num_stages=3, num_warps=8),
-        triton.Config({'q_block_size': 16}, num_stages=4, num_warps=4),
-        triton.Config({'q_block_size': 16}, num_stages=2, num_warps=4),
-        triton.Config({'q_block_size': 16}, num_stages=5, num_warps=2),
+        # triton.Config({'q_block_size': 16}, num_stages=3, num_warps=8),
+        # triton.Config({'q_block_size': 16}, num_stages=2, num_warps=8),
+        # triton.Config({'q_block_size': 16}, num_stages=4, num_warps=4),
+        # triton.Config({'q_block_size': 16}, num_stages=3, num_warps=4),
+        # triton.Config({'q_block_size': 16}, num_stages=2, num_warps=4),
+        # triton.Config({'q_block_size': 16}, num_stages=5, num_warps=2),
+        # triton.Config({'q_block_size': 16}, num_stages=4, num_warps=2),
         triton.Config({'q_block_size': 16}, num_stages=3, num_warps=2),
-        triton.Config({'q_block_size': 16}, num_stages=2, num_warps=2),
+        # triton.Config({'q_block_size': 16}, num_stages=2, num_warps=2),
     ],
-    key=['num_heads', 'head_size', 'block_size'],
+    key=['num_heads', 'head_size', 'block_size',],
 )
 @triton.jit
 def page_attn_kernel_v2(
@@ -151,24 +159,27 @@ def page_attn_kernel_v2(
     query_ptrs = query + (bi * num_heads + hi) * head_size * q_seq_len + q_dim[:, None] * head_size + h_dim[None, :]
     query = tl.load(query_ptrs, mask=q_dim[:, None] < q_seq_len) # [q_block_size, head_size]
     
-    kv_offsets = h_dim[:, None] * block_size + seq_dim[None, :]
+    k_offsets = h_dim[:, None] * block_size + seq_dim[None, :]
+    v_offsets = h_dim[None, :] * block_size + seq_dim[:, None]
 
-    mi = tl.full([q_block_size], float('-inf'), dtype=tl.float32)
+    mi = tl.zeros([q_block_size], dtype=tl.float32)
+    mi -= float('inf')
     si = tl.zeros([q_block_size], dtype=tl.float32)
     acc = tl.zeros([q_block_size, head_size], dtype=tl.float32)
 
     for i in range(0, tl.cdiv(seq_len, block_size)):
         block_idx = tl.load(cache_blocks + bi * max_cache_blocks + i)
-        kv_offset = block_idx * num_heads * head_size * block_size + hi * head_size * block_size + kv_offsets
-        key = tl.load(key_cache + kv_offset) # [head_size, block_size]
+        k_offset = block_idx * num_heads * head_size * block_size + hi * head_size * block_size + k_offsets
+        key = tl.load(key_cache + k_offset) # [head_size, block_size]
         qk = tl.dot(query, key) # [q_block_size, block_size]
         new_mi = tl.maximum(tl.max(qk, 1), mi)
         p = tl.exp(qk - new_mi[:, None])
         alpha = tl.exp(mi - new_mi)
         si = si * alpha + tl.sum(p, 1)
         mi = new_mi
-        val = tl.load(val_cache + kv_offset) # [head_size, block_size]
-        qkv = tl.dot(p.to(key_cache.dtype.element_ty), tl.trans(val)) # [q_block_size, head_size]
+        v_offset = block_idx * num_heads * head_size * block_size + hi * head_size * block_size + v_offsets
+        val = tl.load(val_cache + v_offset) # [head_size, block_size]
+        qkv = tl.dot(p.to(key_cache.dtype.element_ty), val) # [q_block_size, head_size]
         acc = acc * alpha[:, None] + qkv
     
     acc = acc / si[:, None]
@@ -193,16 +204,15 @@ def triton_paged_attn(query: Tensor, seq_lengths: Tensor, cache_blocks: Tensor, 
 
     return out
 
-
-def triton_paged_attnv2(query: Tensor, seq_lengths: Tensor, cache_blocks: Tensor, key_cache: Tensor, value_cache: Tensor):
+def triton_paged_attnv2(query: Tensor, seq_lengths: Tensor, cache_blocks: Tensor, key_cache: Tensor, value_cache: Tensor, max_context_len: int = 1024):
     bs, num_heads, _, head_size = query.shape
     _, max_cache_blocks = cache_blocks.shape
     _, num_heads, _, block_size = key_cache.shape
     out = torch.empty_like(query)
 
     page_attn_kernel_v2[(bs * num_heads,)](out, query, seq_lengths, cache_blocks, key_cache,
-                                      value_cache, num_heads, max_cache_blocks, 1,
-                                      head_size, block_size)
+                                           value_cache, num_heads, max_cache_blocks, 1,
+                                           head_size, block_size)
 
     return out
 
@@ -259,10 +269,10 @@ def test_vllm_correctness():
 
 
 def test():
-    bs = 4
-    num_heads = 12
-    head_size = 128
-    seq_len = 4096
+    bs = 1
+    num_heads = 8
+    head_size = 64
+    seq_len = 16
     block_size = 16
     num_blocks = bs * seq_len // block_size
 
@@ -283,18 +293,21 @@ def test():
 
     out2 = triton_paged_attn(query, seq_lengths, cache_blocks, key_cache, val_cache)
 
+    out4 = triton_paged_attnv2(query, seq_lengths, cache_blocks, key_cache, val_cache)
     # print((out1 - out2).abs().max())
 
     x = 16 // torch.tensor([], dtype=query.dtype).element_size()
     key_cache_ = key_cache.reshape([num_blocks, num_heads, head_size//x, x, block_size]).transpose(-1, -2).reshape([num_blocks, num_heads, head_size, block_size])
     out3 = page_attention_vllm(query, seq_lengths, cache_blocks, key_cache_, val_cache, max_context_len=seq_len)
 
-    out4 = triton_paged_attnv2(query, seq_lengths, cache_blocks, key_cache, val_cache)
     print((out0.squeeze() - out3).abs().max())
     # print((out1.squeeze() - out3).abs().max())
     print((out2.squeeze() - out3).abs().max())
 
     print((out4.squeeze() - out3).abs().max())
+    # print((out4.squeeze() - out3).abs())
+
+# test()
 
 
 
@@ -309,7 +322,7 @@ if __name__ == '__main__':
     @triton.testing.perf_report(
         triton.testing.Benchmark(
             x_names=['seq'],  # Argument names to use as an x-axis for the plot
-            x_vals=[128 * i for i in range(1, 33)],  # Different possible values for `x_name`
+            x_vals=[256 * i for i in range(1, 36)],  # Different possible values for `x_name`
             line_arg='provider',  # Argument name whose value corresponds to a different line in the plot
             # Possible values for `line_arg`
             line_vals=['vllm', 'triton', 'tritonv2'],
@@ -336,3 +349,9 @@ if __name__ == '__main__':
 
 
     benchmark.run(show_plots=True, print_data=True)
+
+# # %%
+# for k, v in page_attn_kernel_v2.configs_timings.items():
+#     print(k, v)
+# for k, v in page_attn_kernel.configs_timings.items():
+#     print(k, v)
