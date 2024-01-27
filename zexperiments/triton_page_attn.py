@@ -192,6 +192,69 @@ def page_attn_kernel_v2(
     tl.store(out + out_offset, acc, mask=q_dim[:, None] < q_seq_len)
 
 
+# @triton.jit
+# def page_attn_kernel_v3(
+#     out, # f32/f16[bs, num_heads, 1, head_size]
+#     query, # f32/f16[bs, num_heads, 1, head_size]
+#     seq_lens, # i32[bs]
+#     cache_blocks, # i32[bs, max_cache_blocks]
+#     key_cache, # f32/f16[num_blocks, num_heads, block_size, head_size]
+#     val_cache, # f32/f16[num_blocks, num_heads, block_size, head_size]
+#     num_heads,
+#     max_cache_blocks,
+#     q_seq_len,
+#     hm_factor: tl.constexpr,
+#     hk_factor: tl.constexpr,
+#     block_size: tl.constexpr,
+# ):
+#     # use matrix instruction to compute dot-product
+#     # split head_size into hm and hk => hm_factor * hk_factor == head_size
+#     bi = tl.program_id(0) // num_heads
+#     hi = tl.program_id(0) % num_heads
+
+#     seq_len = tl.load(seq_lens + bi)
+
+#     hm_factor = tl.arange(0, hm_factor)
+#     hk_factor = tl.arange(0, hk_factor)
+#     seq_dim = tl.arange(0, block_size)
+
+#     head_offset = (bi * num_heads + hi) * head_size
+#     query_offset = head_offset + hm_factor[:, None] * hk_factor + hk_factor[None, :]
+#     query = tl.load(query + query_offset) # [hm_factor, hk_factor]
+    
+#     k_offsets = seq_dim[:, None, None] * (hm_factor * hk_factor) + hk_factor[None, :, None] + hm_factor[None, None, :] * hk_factor
+#     v_offsets = h_dim[None, :] * block_size + seq_dim[:, None]
+
+#     mi = tl.zeros([q_block_size], dtype=tl.float32)
+#     mi -= float('inf')
+#     si = tl.zeros([q_block_size], dtype=tl.float32)
+#     acc = tl.zeros([q_block_size, head_size], dtype=tl.float32)
+
+#     for i in range(0, tl.cdiv(seq_len, block_size)):
+#         block_idx = tl.load(cache_blocks + bi * max_cache_blocks + i)
+#         k_offset = block_idx * num_heads * head_size * block_size + hi * head_size * block_size + k_offsets
+#         key = tl.load(key_cache + k_offset) # [head_size, block_size]
+#         qk = tl.dot(query, key) # [q_block_size, block_size]
+#         new_mi = tl.maximum(tl.max(qk, 1), mi)
+#         p = tl.exp(qk - new_mi[:, None])
+#         alpha = tl.exp(mi - new_mi)
+#         si = si * alpha + tl.sum(p, 1)
+#         mi = new_mi
+#         v_offset = block_idx * num_heads * head_size * block_size + hi * head_size * block_size + v_offsets
+#         val = tl.load(val_cache + v_offset) # [head_size, block_size]
+#         qkv = tl.dot(p.to(key_cache.dtype.element_ty), val) # [q_block_size, head_size]
+#         acc = acc * alpha[:, None] + qkv
+    
+#     acc = acc / si[:, None]
+#     acc = acc.to(key_cache.dtype.element_ty)
+
+#     q_dim = tl.arange(0, q_block_size)
+#     h_dim = tl.arange(0, head_size)
+
+#     out_offset = (bi * num_heads * head_size + hi * head_size) * q_seq_len + q_dim[:, None] * head_size + h_dim[None, :]
+#     tl.store(out + out_offset, acc, mask=q_dim[:, None] < q_seq_len)
+
+
 def triton_paged_attn(query: Tensor, seq_lengths: Tensor, cache_blocks: Tensor, key_cache: Tensor, value_cache: Tensor):
     bs, num_heads, _, head_size = query.shape
     _, max_cache_blocks = cache_blocks.shape
@@ -229,7 +292,7 @@ def make_inputs_dense(bs=4, num_heads=8, head_size=4, seq_len=64, block_size=16,
 from vllm.model_executor.layers.attention import _paged_attention
 from vllm.model_executor import InputMetadata
 
-def page_attention_vllm(query: Tensor, seq_lengths: Tensor, cache_blocks: Tensor, key_cache: Tensor, value_cache: Tensor, max_context_len: int = 1024):
+def page_attention_vllm(query: Tensor, seq_lengths: Tensor, cache_blocks: Tensor, key_cache: Tensor, value_cache: Tensor, max_context_len: int = 1024, num_kv_heads = None):
     """
     query: [bs, num_heads, 1, head_size]
     key_cache: [num_blocks, num_heads, head_size, block_size]
@@ -238,11 +301,13 @@ def page_attention_vllm(query: Tensor, seq_lengths: Tensor, cache_blocks: Tensor
     bs, nh, _, hs = query.shape
     x = 16 // torch.tensor([], dtype=query.dtype).element_size()
     num_blocks, num_heads, head_size, block_size = value_cache.shape
+    if num_kv_heads is None:
+        num_kv_heads = num_heads
     # key_cache: [num_blocks, num_heads, head_size//x, block_size, x]
     key_cache = key_cache.view(num_blocks, num_heads, head_size // x, block_size, x)
     return _paged_attention(
         query.view(bs, nh, hs), key_cache, value_cache, 
-        InputMetadata(False, None, max_context_len, seq_lengths, cache_blocks, False), num_heads, 1.0, None
+        InputMetadata(False, None, max_context_len, seq_lengths, cache_blocks, False), num_kv_heads, 1.0, None
     )
 
 
@@ -267,6 +332,12 @@ def test_vllm_correctness():
 
     print((out0.squeeze() - out1).abs().max())
 
+import hidet
+from hidet.apps.llm.ops.page_attention import page_attention as hidet_page_attention_
+
+def hidet_page_attention(query: Tensor, seq_lengths: Tensor, cache_blocks: Tensor, key_cache: Tensor, value_cache: Tensor):
+    y = hidet_page_attention_(hidet.from_torch(query).to(hidet.float16), hidet.from_torch(seq_lengths).to(hidet.float16), hidet.from_torch(cache_blocks).to(hidet.float16), hidet.from_torch(key_cache).to(hidet.float16), hidet.from_torch(value_cache).to(hidet.float16))
+    return y.torch().to(query.dtype)
 
 def test():
     bs = 1
@@ -300,16 +371,22 @@ def test():
     key_cache_ = key_cache.reshape([num_blocks, num_heads, head_size//x, x, block_size]).transpose(-1, -2).reshape([num_blocks, num_heads, head_size, block_size])
     out3 = page_attention_vllm(query, seq_lengths, cache_blocks, key_cache_, val_cache, max_context_len=seq_len)
 
+    # out5 = hidet_page_attention(query, seq_lengths, cache_blocks, key_cache, val_cache)
+
     print((out0.squeeze() - out3).abs().max())
     # print((out1.squeeze() - out3).abs().max())
     print((out2.squeeze() - out3).abs().max())
 
     print((out4.squeeze() - out3).abs().max())
+
+    # print((out5.squeeze() - out3).abs().max())
     # print((out4.squeeze() - out3).abs())
 
-# test()
+test()
 
-
+# %%
+args = make_inputs_dense(head_size=64)
+page_attention_vllm(*args, num_kv_heads=16)
 
 # %%
 
