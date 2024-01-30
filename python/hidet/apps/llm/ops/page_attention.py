@@ -2,7 +2,7 @@
 from typing import List, Union, Tuple
 
 from hidet.ir import IRModule
-from hidet.ir.dtypes import float16
+from hidet.ir.dtypes import float16, float32
 from hidet.ir.expr import symbol_var
 from hidet.graph.tensor import Tensor
 from hidet.graph.ops.opaque import OpaqueOperator
@@ -406,15 +406,19 @@ class PageAttentionOpV2(OpaqueOperator):
         self, query: Tensor, seq_lengths: Tensor, cache_blocks: Tensor, key_cache: Tensor, value_cache: Tensor
     ):
         assert query.dtype == key_cache.dtype == value_cache.dtype, 'Mismatched dtype of query, key, value'
-        assert query.dtype in [float16], f'Unsupported dtype: {query.dtype}'
+        assert query.dtype in [float16, float32], f'Unsupported dtype: {query.dtype}'
         bs, num_heads, _, head_size = query.shape
         return {'output': self.symbol(shape=[bs, num_heads, 1, head_size], dtype=query.dtype, device=query.device)}
 
     def implement_cuda(self, inputs: List[Tensor], outputs: List[Tensor]) -> Union[IRModule, List[IRModule]]:
-        return tune.extract_ir_modules(self.schedule_cuda(num_threads=128, partition_size=0))
+        return tune.extract_ir_modules(self.schedule_cuda)
 
-    @tune.space(1)  # empty space
-    def schedule_cuda(self, num_threads: int, partition_size: int) -> IRModule:
+    @tune.space(
+        1,
+        num_threads=[128],
+        partition_size=[0],
+    )  # empty space
+    def schedule_cuda(self, num_threads: int = 128, partition_size: int = 0) -> IRModule:
         # naive implementation, todo: optimize this kernel
         import hidet
         from hidet.lang import attrs, cast, printf, shared_tensor
@@ -427,22 +431,22 @@ class PageAttentionOpV2(OpaqueOperator):
         _query, _seq_lengths, _cache_blocks, _key_cache, _value_cache = self.inputs
         dtype = self.inputs[0].dtype
 
-        bs, num_heads, _, head_size = self.inputs[0].shape
+        bs, num_heads_, _, head_size = self.inputs[0].shape
         max_cache_blocks = _cache_blocks.shape[-1]
         num_blocks, num_kv_heads, head_size, block_size = _key_cache.shape
 
         WARP_SIZE = 32
-        THREAD_GROUP_SIZE = max(WARP_SIZE / block_size, 1)
-        VEC_SIZE = max(16 / (THREAD_GROUP_SIZE * dtype.nbytes), 1)
-        V_VEC_SIZE = min(16 / dtype.nbytes, block_size)
-        NUM_ELEMS_PER_THREAD = head_size / THREAD_GROUP_SIZE
-        NUM_VECS_PER_THREAD = NUM_ELEMS_PER_THREAD / VEC_SIZE
+        THREAD_GROUP_SIZE = max(WARP_SIZE // block_size, 1)
+        VEC_SIZE = max(16 // (THREAD_GROUP_SIZE * dtype.nbytes), 1)
+        V_VEC_SIZE = min(16 // dtype.nbytes, block_size)
+        NUM_ELEMS_PER_THREAD = head_size // THREAD_GROUP_SIZE
+        NUM_VECS_PER_THREAD = NUM_ELEMS_PER_THREAD // VEC_SIZE
         NUM_TOKENS_PER_THREAD_GROUP = (block_size + WARP_SIZE - 1) // WARP_SIZE
-        NUM_WARPS = num_threads / WARP_SIZE
+        NUM_WARPS = num_threads // WARP_SIZE
 
         padded_context_len = (self.attrs['max_context_len'] // block_size) * block_size
         logits_size = padded_context_len * dtype.nbytes
-        outputs_size = (NUM_WARPS / 2) * head_size * dtype.nbytes
+        outputs_size = (NUM_WARPS // 2) * head_size * dtype.nbytes
         shared_mem_size = max(logits_size, outputs_size)
         
         vec_dtype = vectorize(dtype, VEC_SIZE)
@@ -456,20 +460,18 @@ class PageAttentionOpV2(OpaqueOperator):
                 k: ~vec_dtype,
             ) -> f32:
                 attrs.func_kind = 'cuda_internal'
-                acc = vec_dtype.zero
-
-                for i in range(NUM_VECS_PER_THREAD):
-                    acc += q[i] * k[i]
-                
                 accum = f32.zero
-                for i in range(VEC_SIZE):
-                    accum += cast(cast(~acc, ~dtype)[0], f32)
+                for i in range(NUM_VECS_PER_THREAD):
+                    q0 = q[i]
+                    k0 = k[i]
+                    for j in range(VEC_SIZE):
+                        accum += cast(~q0, ~dtype)[j] * cast(~k0, ~dtype)[j]
                 
                 # sum across lanes
-                m = THREAD_GROUP_SIZE / 2
+                m = THREAD_GROUP_SIZE // 2
                 while m >= 1:
                     accum += shfl_xor_sync(0xFFFFFFFF, accum, m)
-                    m /= 2
+                    m //= 2
                 
                 return accum
         
@@ -479,13 +481,13 @@ class PageAttentionOpV2(OpaqueOperator):
                 val: f32,
             ) -> f32:
                 attrs.func_kind = 'cuda_internal'
-                warp = threadIdx.x / WARP_SIZE
+                warp = threadIdx.x // WARP_SIZE
                 lane = threadIdx.x % WARP_SIZE
                 
-                m = WARP_SIZE / 2
+                m = WARP_SIZE // 2
                 while m >= 1:
                     val += shfl_xor_sync(0xFFFFFFFF, val, m)
-                    m /= 2
+                    m //= 2
                 
                 if lane == 0:
                     smem[warp] = val
@@ -494,12 +496,20 @@ class PageAttentionOpV2(OpaqueOperator):
 
                 val = smem[lane] if lane < NUM_WARPS else f32.zero
 
-                m = NUM_WARPS / 2
+                m = NUM_WARPS // 2
                 while m >= 1:
                     val += shfl_xor_sync(0xFFFFFFFF, val, m)
-                    m /= 2
+                    m //= 2
                 
                 return shfl_sync(0xFFFFFFFF, val, 0)
+            
+            @hidet.script
+            def cdiv(
+                a: i32,
+                b: i32,
+            ) -> i32:
+                attrs.func_kind = 'cuda_internal'
+                return (a + b - 1) // b
         
             @hidet.script
             def page_attention_kernel(
@@ -519,7 +529,7 @@ class PageAttentionOpV2(OpaqueOperator):
                 kv_head_stride: i32
             ):
                 attrs.func_kind = 'cuda_kernel'
-                attrs.cuda.grid_dim = (num_heads, bs)
+                attrs.cuda.grid_dim = (num_heads_, bs)
                 attrs.cuda.block_dim = num_threads
                 attrs.cuda.dynamic_smem_bytes = shared_mem_size
 
@@ -535,7 +545,7 @@ class PageAttentionOpV2(OpaqueOperator):
                 num_context_blocks = (context_len + block_size - 1) // block_size
                 num_blocks_per_partition = num_context_blocks
                 if use_partitioning:
-                    num_blocks_per_partition = partition_size / block_size
+                    num_blocks_per_partition = partition_size // block_size
                 
                 start_block_idx = 0
                 if use_partitioning:
@@ -548,89 +558,102 @@ class PageAttentionOpV2(OpaqueOperator):
                 num_tokens = end_token_idx - start_token_idx
 
                 
-                NUM_THREAD_GROUPS = num_threads / THREAD_GROUP_SIZE
+                NUM_THREAD_GROUPS = num_threads // THREAD_GROUP_SIZE
                 assert(num_threads % THREAD_GROUP_SIZE == 0)
                 
                 thread_idx = threadIdx.x
-                warp_idx = thread_idx / WARP_SIZE
+                warp_idx = thread_idx // WARP_SIZE
                 lane = thread_idx % WARP_SIZE
 
                 head_idx = blockIdx.x
                 num_heads = gridDim.x
-                num_queries_per_kv = num_heads / num_kv_heads
-                kv_head_idx = head_idx / num_queries_per_kv
+                num_queries_per_kv = num_heads // num_kv_heads
+                kv_head_idx = head_idx // num_queries_per_kv
 
                 
 
-                thread_group_idx = thread_idx / THREAD_GROUP_SIZE
+                thread_group_idx = thread_idx // THREAD_GROUP_SIZE
                 thread_group_offset = thread_idx % THREAD_GROUP_SIZE
 
                 q_ptr = q + seq_idx * q_stride + head_idx * head_size
                 q_vecs = shared_tensor(vec_dtype, shape=[THREAD_GROUP_SIZE, NUM_VECS_PER_THREAD])
                 
-                for i in range(thread_group_idx, NUM_VECS_PER_THREAD, NUM_THREAD_GROUPS):
-                    vec_idx = thread_group_offset + i * THREAD_GROUP_SIZE
+                # for i in range(thread_group_idx, NUM_VECS_PER_THREAD, NUM_THREAD_GROUPS):
+                i1 = thread_group_idx
+                while i1 < NUM_VECS_PER_THREAD:
+                    vec_idx = thread_group_offset + i1 * THREAD_GROUP_SIZE
                     q_ptr_1 = q_ptr + vec_idx * VEC_SIZE
-                    q_vecs[thread_group_offset][i] = cast(q_ptr_1, ~vec_dtype)[0]
+                    q_vecs[thread_group_offset][i1] = cast(q_ptr_1, ~vec_dtype)[0]
+                    i1 += NUM_THREAD_GROUPS
                 
                 syncthreads()
                 logits = dynamic_shared_memory(0, f32)
                 red_smem = shared_tensor(f32, shape=[2 * NUM_WARPS])
 
-                x = 16 / dtype.nbytes
+                x = 16 // dtype.nbytes
                 qk_max = -f32.max_value
 
                 block_table = block_tables + seq_idx * max_num_blocks_per_seq
-                for block_idx in range(start_block_idx + warp_idx, end_block_idx, NUM_WARPS):
+                # for block_idx in range(start_block_idx + warp_idx, end_block_idx, NUM_WARPS):
+                block_idx = start_block_idx + warp_idx
+                while block_idx < end_block_idx:
                     physical_block_number = cast(block_table[block_idx], i64)
 
-                    for i in range(0, NUM_TOKENS_PER_THREAD_GROUP):
+                    for i in range(NUM_TOKENS_PER_THREAD_GROUP):
                         physical_block_offset = (thread_group_idx + i * WARP_SIZE) % block_size
                         token_idx = block_idx * block_size + physical_block_offset
                         k_vecs = register_tensor(vec_dtype, shape=[NUM_VECS_PER_THREAD])
 
-                        for j in range(0, NUM_VECS_PER_THREAD):
+                        for j in range(NUM_VECS_PER_THREAD):
                             k_ptr = k_cache + physical_block_number * kv_block_stride + kv_head_idx * kv_head_stride + physical_block_offset * x
                             vec_idx = thread_group_offset + j * THREAD_GROUP_SIZE
-                            offset1 = (vec_idx * VEC_SIZE) / x
+                            offset1 = (vec_idx * VEC_SIZE) // x
                             offset2 = (vec_idx * VEC_SIZE) % x
                             k_ptr_1 = k_ptr + offset1 * block_size * x + offset2
                             k_vecs[j] = cast(k_ptr_1, ~vec_dtype)[0]
 
-                        qk = qk_dot(~q_vecs[thread_group_offset], ~k_vecs)
+                        qk = qk_dot(~q_vecs[thread_group_offset][0], ~k_vecs[0])
 
                         if thread_group_offset == 0:
                             mask = token_idx >= context_len
                             logits[token_idx - start_token_idx] = 0.0 if mask else qk
                             qk_max = qk_max if mask else max(qk_max, qk)
                     
-                m1 = WARP_SIZE / 2
+                    block_idx += NUM_WARPS
+                    
+                m1 = WARP_SIZE // 2
                 while m1 >= THREAD_GROUP_SIZE:
                     qk_max = max(qk_max, shfl_xor_sync(0xFFFFFFFF, qk_max, m1))
-                    m1 /= 2
+                    m1 //= 2
                 if lane == 0:
                     red_smem[warp_idx] = qk_max
                 syncthreads()
 
                 qk_max = red_smem[lane] if lane < NUM_WARPS else -f32.max_value
-                m1 = NUM_WARPS / 2
+                m1 = NUM_WARPS // 2
                 while m1 >= 1:
                     qk_max = max(qk_max, shfl_xor_sync(0xFFFFFFFF, qk_max, m1))
-                    m1 /= 2
+                    m1 //= 2
                 syncthreads()
                 qk_max = shfl_sync(0xFFFFFFFF, qk_max, 0)
 
                 exp_sum = f32.zero
-                for i in range(thread_idx, num_tokens, num_threads):
-                    val = exp(logits[i] - qk_max)
-                    logits[i] = val
+                # for i in range(thread_idx, num_tokens, num_threads):
+                i2 = thread_idx
+                while i2 < num_tokens:
+                    val = exp(logits[i2] - qk_max)
+                    logits[i2] = val
                     exp_sum += val
+                    i2 += num_threads
                 
                 exp_sum = block_sum(~red_smem[NUM_WARPS], exp_sum)
 
                 inv_sum = 1 / (exp_sum + 1e-6)
-                for i in range(thread_idx, num_tokens, num_threads):
-                    logits[i] *= inv_sum
+                # for i in range(thread_idx, num_tokens, num_threads):
+                i3 = thread_idx
+                while i3 < num_tokens:
+                    logits[i3] *= inv_sum
+                    i3 += num_threads
                 
                 syncthreads()
 
@@ -640,18 +663,20 @@ class PageAttentionOpV2(OpaqueOperator):
                     exp_sums_ptr = exp_sums + seq_idx * num_heads * max_num_partitions + head_idx * max_num_partitions + partition_idx
                     exp_sums_ptr[0] = exp_sum
                 
-                NUM_V_VECS_PER_ROW = block_size / V_VEC_SIZE
-                NUM_ROWS_PER_ITER  = WARP_SIZE / NUM_V_VECS_PER_ROW
-                NUM_ROWS_PER_THREAD = (head_size + NUM_ROWS_PER_ITER - 1) / NUM_ROWS_PER_ITER
+                NUM_V_VECS_PER_ROW = block_size // V_VEC_SIZE
+                NUM_ROWS_PER_ITER  = WARP_SIZE // NUM_V_VECS_PER_ROW
+                NUM_ROWS_PER_THREAD = (head_size + NUM_ROWS_PER_ITER - 1) // NUM_ROWS_PER_ITER
 
                 accs = register_tensor(f32, [NUM_ROWS_PER_THREAD])
 
                 for i in range(NUM_ROWS_PER_THREAD):
                     accs[i] = 0.0
                 
-                for block_idx in range(start_block_idx + warp_idx, end_block_idx, NUM_WARPS):
+                # for block_idx in range(start_block_idx + warp_idx, end_block_idx, NUM_WARPS):
+                block_idx = start_block_idx + warp_idx
+                while block_idx < end_block_idx:
                     physical_block_number = cast(block_table[block_idx], i64)
-                    physical_block_offset = (lane / NUM_V_VECS_PER_ROW) * V_VEC_SIZE
+                    physical_block_offset = (lane // NUM_V_VECS_PER_ROW) * V_VEC_SIZE
                     token_idx = block_idx * block_size + physical_block_offset
                     logits_vec = cast(logits + token_idx - start_token_idx, ~v_vec_dtype)[0]
 
@@ -670,14 +695,15 @@ class PageAttentionOpV2(OpaqueOperator):
                             # accs[i] += dot(~logits_vec, ~v_vec)
                             for j in range(V_VEC_SIZE):
                                 accs[i] += cast(~logits_vec, ~dtype)[j] * cast(~v_vec, ~dtype)[j]
-                            
+                    
+                    block_idx += NUM_WARPS
 
                 for i in range(NUM_ROWS_PER_THREAD):
                     acc = accs[i]
-                    m1 = NUM_V_VECS_PER_ROW / 2
+                    m1 = NUM_V_VECS_PER_ROW // 2
                     while m1 >= 1:
                         acc += shfl_xor_sync(0xFFFFFFFF, acc, m1)
-                        m1 /= 2
+                        m1 //= 2
                     accs[i] = acc
                 
                 syncthreads()
@@ -686,45 +712,45 @@ class PageAttentionOpV2(OpaqueOperator):
 
                 m1 = NUM_WARPS
                 while m1 >= 1:
-                    mid = i / 2
+                    mid = m1 // 2
 
-                    if warp_idx >= mid and warp_idx <  i:
+                    if warp_idx >= mid and warp_idx < m1:
                         dst = out_smem + (warp_idx - mid) * head_size
 
                         for j in range(NUM_ROWS_PER_THREAD):
-                            row_idx = lane / NUM_V_VECS_PER_ROW + j * NUM_ROWS_PER_ITER
+                            row_idx = lane // NUM_V_VECS_PER_ROW + j * NUM_ROWS_PER_ITER
                             if row_idx < head_size and lane % NUM_V_VECS_PER_ROW == 0:
-                                dst[row_idx] = accs[i]
+                                dst[row_idx] = accs[m1]
                 
                     syncthreads()
 
                     if warp_idx < mid:
                         src = out_smem + warp_idx * head_size
                         for j in range(NUM_ROWS_PER_THREAD):
-                            row_idx = lane / NUM_V_VECS_PER_ROW + j * NUM_ROWS_PER_ITER
+                            row_idx = lane // NUM_V_VECS_PER_ROW + j * NUM_ROWS_PER_ITER
                             if row_idx < head_size and lane % NUM_V_VECS_PER_ROW == 0:
-                                accs[i] += src[row_idx]
+                                accs[m1] += src[row_idx]
                     
                     syncthreads()
 
-                    m1 /= 2
+                    m1 //= 2
                 
                 if warp_idx == 0:
                     out_ptr = out + seq_idx * num_heads * head_size + head_idx * max_num_partitions * head_size + partition_idx * head_size
 
                     for i in range(NUM_ROWS_PER_THREAD):
-                        row_idx = lane / NUM_V_VECS_PER_ROW + i * NUM_ROWS_PER_ITER
+                        row_idx = lane // NUM_V_VECS_PER_ROW + i * NUM_ROWS_PER_ITER
                         if row_idx < head_size and lane % NUM_V_VECS_PER_ROW == 0:
                             out_ptr[row_idx] = cast(accs[i], dtype)
 
             @hidet.script
             def launch(
-                query: dtype[bs, num_heads, 1, head_size],
+                query: dtype[bs, num_heads_, 1, head_size],
                 seq_lengths: i32[bs],
                 cache_blocks: i32[bs, max_cache_blocks],
                 key_cache: dtype[num_blocks, num_kv_heads, head_size, block_size],
                 value_cache: dtype[num_blocks, num_kv_heads, head_size, block_size],
-                output: dtype[bs, num_heads, 1, head_size],
+                output: dtype[bs, num_heads_, 1, head_size],
             ):
                 attrs.func_kind = 'public'
 
@@ -800,7 +826,7 @@ def page_attention(query: Tensor, seq_lengths: Tensor, cache_blocks: Tensor, key
     """
     return PageAttentionOpV2(query, seq_lengths, cache_blocks, key_cache, value_cache, max_context_len).outputs[0]
 
-# %%
+
 import torch
 
 def make_inputs_dense(bs=4, num_heads=8, head_size=4, seq_len=64, block_size=16, dtype=torch.float32):
@@ -836,17 +862,18 @@ def page_attention_vllm(query: Tensor, seq_lengths: Tensor, cache_blocks: Tensor
 
 
 import hidet
-from hidet.apps.llm.ops.page_attention import page_attention as hidet_page_attention_
 
 def hidet_page_attention(query: Tensor, seq_lengths: Tensor, cache_blocks: Tensor, key_cache: Tensor, value_cache: Tensor):
-    y = hidet_page_attention_(
-        hidet.from_torch(query).to(hidet.float16), 
-        hidet.from_torch(seq_lengths).to(hidet.float16), 
-        hidet.from_torch(cache_blocks).to(hidet.float16), 
-        hidet.from_torch(key_cache).to(hidet.float16), 
-        hidet.from_torch(value_cache).to(hidet.float16)
+    hidet.option.debug_cache_tuning(True)
+    hidet.option.cache_dir('zexperiments/cache')
+    y = page_attention(
+        hidet.from_torch(query), 
+        hidet.from_torch(seq_lengths), 
+        hidet.from_torch(cache_blocks), 
+        hidet.from_torch(key_cache), 
+        hidet.from_torch(value_cache)
     )
-    return y.torch().to(query.dtype)
+    return y.torch().to(query.dtype).squeeze()
 
 def test():
 
@@ -860,5 +887,7 @@ def test():
 
     print(out1.shape, out2.shape)
     print((out1 - out2).abs().max())
+    
+    return out1, out2
 
-test()
+out1, out2 = test()
