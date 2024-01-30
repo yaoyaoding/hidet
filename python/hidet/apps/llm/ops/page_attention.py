@@ -1,3 +1,4 @@
+# %%
 from typing import List, Union, Tuple
 
 from hidet.ir import IRModule
@@ -384,10 +385,10 @@ class PageAttentionOp(OpaqueOperator):
         return script_module.ir_module()
 
 
-
 class PageAttentionOpV2(OpaqueOperator):
     def __init__(
-        self, query: Tensor, seq_lengths: Tensor, cache_blocks: Tensor, key_cache: Tensor, value_cache: Tensor
+        self, query: Tensor, seq_lengths: Tensor, cache_blocks: Tensor, key_cache: Tensor, value_cache: Tensor,
+        max_context_len: int
     ):
         super().__init__(
             name='page_attentionV2',
@@ -398,6 +399,7 @@ class PageAttentionOpV2(OpaqueOperator):
                 'key_cache': key_cache,
                 'value_cache': value_cache,
             },
+            attributes={'max_context_len': max_context_len}
         )
 
     def symbolic_forward(
@@ -409,7 +411,7 @@ class PageAttentionOpV2(OpaqueOperator):
         return {'output': self.symbol(shape=[bs, num_heads, 1, head_size], dtype=query.dtype, device=query.device)}
 
     def implement_cuda(self, inputs: List[Tensor], outputs: List[Tensor]) -> Union[IRModule, List[IRModule]]:
-        return tune.extract_ir_modules(self.schedule_cuda)
+        return tune.extract_ir_modules(self.schedule_cuda(num_threads=128, partition_size=0))
 
     @tune.space(1)  # empty space
     def schedule_cuda(self, num_threads: int, partition_size: int) -> IRModule:
@@ -437,13 +439,68 @@ class PageAttentionOpV2(OpaqueOperator):
         NUM_VECS_PER_THREAD = NUM_ELEMS_PER_THREAD / VEC_SIZE
         NUM_TOKENS_PER_THREAD_GROUP = (block_size + WARP_SIZE - 1) // WARP_SIZE
         NUM_WARPS = num_threads / WARP_SIZE
+
+        padded_context_len = (self.attrs['max_context_len'] // block_size) * block_size
+        logits_size = padded_context_len * dtype.nbytes
+        outputs_size = (NUM_WARPS / 2) * head_size * dtype.nbytes
+        shared_mem_size = max(logits_size, outputs_size)
         
         vec_dtype = vectorize(dtype, VEC_SIZE)
         v_vec_dtype = vectorize(dtype, V_VEC_SIZE)
-        tile_size = 128
 
         assert int(32 % block_size) == 0
         with hidet.script_module() as script_module:
+            @hidet.script
+            def qk_dot(
+                q: ~vec_dtype,
+                k: ~vec_dtype,
+            ) -> f32:
+                attrs.func_kind = 'cuda_internal'
+                acc = vec_dtype.zero
+
+                for i in range(NUM_VECS_PER_THREAD):
+                    acc += q[i] * k[i]
+                
+                accum = f32.zero
+                for i in range(VEC_SIZE):
+                    accum += cast(cast(~acc, ~dtype)[0], f32)
+                
+                # sum across lanes
+                m = THREAD_GROUP_SIZE / 2
+                while m >= 1:
+                    accum += shfl_xor_sync(0xFFFFFFFF, accum, m)
+                    m /= 2
+                
+                return accum
+        
+            @hidet.script
+            def block_sum(
+                smem: ~f32,
+                val: f32,
+            ) -> f32:
+                attrs.func_kind = 'cuda_internal'
+                warp = threadIdx.x / WARP_SIZE
+                lane = threadIdx.x % WARP_SIZE
+                
+                m = WARP_SIZE / 2
+                while m >= 1:
+                    val += shfl_xor_sync(0xFFFFFFFF, val, m)
+                    m /= 2
+                
+                if lane == 0:
+                    smem[warp] = val
+                
+                syncthreads()
+
+                val = smem[lane] if lane < NUM_WARPS else f32.zero
+
+                m = NUM_WARPS / 2
+                while m >= 1:
+                    val += shfl_xor_sync(0xFFFFFFFF, val, m)
+                    m /= 2
+                
+                return shfl_sync(0xFFFFFFFF, val, 0)
+        
             @hidet.script
             def page_attention_kernel(
                 exp_sums: ~f32,
@@ -462,6 +519,9 @@ class PageAttentionOpV2(OpaqueOperator):
                 kv_head_stride: i32
             ):
                 attrs.func_kind = 'cuda_kernel'
+                attrs.cuda.grid_dim = (num_heads, bs)
+                attrs.cuda.block_dim = num_threads
+                attrs.cuda.dynamic_smem_bytes = shared_mem_size
 
                 seq_idx = blockIdx.y
                 partition_idx = blockIdx.z
@@ -645,7 +705,7 @@ class PageAttentionOpV2(OpaqueOperator):
                             if row_idx < head_size and lane % NUM_V_VECS_PER_ROW == 0:
                                 accs[i] += src[row_idx]
                     
-                    syncthreads
+                    syncthreads()
 
                     m1 /= 2
                 
@@ -658,213 +718,26 @@ class PageAttentionOpV2(OpaqueOperator):
                             out_ptr[row_idx] = cast(accs[i], dtype)
 
             @hidet.script
-            def qk_dot(
-                q: ~vec_dtype,
-                k: ~vec_dtype,
-            ) -> f32:
-                attrs.func_kind = 'cuda_internal'
-                acc = vec_dtype.zero
-
-                for i in range(NUM_VECS_PER_THREAD):
-                    acc += q[i] * k[i]
-                
-                accum = f32.zero
-                for i in range(VEC_SIZE):
-                    accum += cast(cast(~acc, ~dtype)[0], f32)
-                
-                # sum across lanes
-                m = THREAD_GROUP_SIZE / 2
-                while m >= 1:
-                    accum += shfl_xor_sync(0xFFFFFFFF, accum, m)
-                    m /= 2
-                
-                return accum
-        
-            @hidet.script
-            def block_sum(
-                smem: ~f32,
-                val: f32,
-            ) -> f32:
-                attrs.func_kind = 'cuda_internal'
-                warp = threadIdx.x / WARP_SIZE
-                lane = threadIdx.x % WARP_SIZE
-                
-                m = WARP_SIZE / 2
-                while m >= 1:
-                    val += shfl_xor_sync(0xFFFFFFFF, val, m)
-                    m /= 2
-                
-                if lane == 0:
-                    smem[warp] = val
-                
-                syncthreads()
-
-                val = smem[lane] if lane < NUM_WARPS else f32.zero
-
-                m = NUM_WARPS / 2
-                while m >= 1:
-                    val += shfl_xor_sync(0xFFFFFFFF, val, m)
-                    m /= 2
-                
-                return shfl_sync(0xFFFFFFFF, val, 0)
-
-            @hidet.script
-            def page_attention_score(
-                max_seq_length: i32,
-                score_ptr: ~f32,
-                query: f16[bs, num_heads, head_size],
-                seq_lengths: i32[bs],
-                cache_blocks: i32[bs, max_cache_blocks],
-                key_cache: f16[num_blocks, num_kv_heads, head_size, block_size],
-            ):
-                attrs.func_kind = 'cuda_kernel'
-                attrs.cuda.grid_dim = (max_seq_length + tile_size - 1) // tile_size, num_heads, bs
-                attrs.cuda.block_dim = tile_size
-
-                bs_idx = blockIdx.z
-                head_idx = blockIdx.y
-
-                score = tensor_pointer(f32, [bs, num_heads, max_seq_length], init=score_ptr)
-
-                j = blockIdx.x * tile_size + threadIdx.x
-                seq_length = seq_lengths[bs_idx]
-
-                if j < seq_length:
-                    acc = f16.zero
-                    block_idx = cache_blocks[bs_idx, j // block_size]
-                    block_offset = j % block_size
-                    kv_head_idx = head_idx % num_kv_heads
-                    for k in range(head_size):
-                        a = query[bs_idx, head_idx, k]
-                        b = key_cache[block_idx, kv_head_idx, k, block_offset]
-                        acc += a * b
-                    acc = acc / sqrt(cast(head_size, f32))
-                    score[bs_idx, head_idx, j] = acc
-
-            @hidet.script
-            def warp_max(val: f32) -> f32:
-                attrs.func_kind = 'cuda_internal'
-                for i in range(5):
-                    val = max(val, shfl_down_sync(0xFFFFFFFF, val, 1 << i))
-                val = shfl_sync(0xFFFFFFFF, val, 0)
-                return val
-
-            @hidet.script
-            def warp_sum(val: f32) -> f32:
-                attrs.func_kind = 'cuda_internal'
-                for i in range(5):
-                    val = val + shfl_down_sync(0xFFFFFFFF, val, 1 << i)
-                val = shfl_sync(0xFFFFFFFF, val, 0)
-                return val
-
-            @hidet.script
-            def page_attention_softmax(max_seq_length: i32, output_ptr: ~f32, score_ptr: ~f32, seq_lengths: i32[bs]):
-                attrs.func_kind = 'cuda_kernel'
-                attrs.cuda.grid_dim = num_heads, bs
-                attrs.cuda.block_dim = 32
-
-                output = tensor_pointer(f32, [bs, num_heads, max_seq_length], init=output_ptr)
-                score = tensor_pointer(f32, [bs, num_heads, max_seq_length], init=score_ptr)
-
-                bs_idx = blockIdx.y
-                head_idx = blockIdx.x
-
-                seq_length = seq_lengths[bs_idx]
-                warp_size = 32
-
-                # max value
-                max_val = f32.min_value
-                for i in range((seq_length + warp_size - 1) / warp_size):
-                    j = i * blockDim.x + threadIdx.x
-                    if j < seq_length:
-                        max_val = max(max_val, score[bs_idx, head_idx, j])
-                max_val = warp_max(max_val)
-
-                # sum exp
-                sum_exp = f32.zero
-                for i in range((seq_length + warp_size - 1) / warp_size):
-                    j = i * blockDim.x + threadIdx.x
-                    if j < seq_length:
-                        sum_exp += exp(score[bs_idx, head_idx, j] - max_val)
-                sum_exp = warp_sum(sum_exp)
-
-                # divide
-                for i in range((seq_length + warp_size - 1) / warp_size):
-                    j = i * blockDim.x + threadIdx.x
-                    if j < seq_length:
-                        output[bs_idx, head_idx, j] = exp(score[bs_idx, head_idx, j] - max_val) / sum_exp
-
-            @hidet.script
-            def page_attention_output(
-                max_seq_length: i32,
-                output: f16[bs, num_heads, 1, head_size],
-                score_ptr: ~f32,
-                seq_lengths: i32[bs],
-                cache_blocks: i32[bs, max_cache_blocks],
-                value_cache: f16[num_blocks, num_kv_heads, head_size, block_size],
-            ):
-                attrs.func_kind = 'cuda_kernel'
-                attrs.cuda.grid_dim = num_heads, bs
-                attrs.cuda.block_dim = head_size
-
-                bs_idx = blockIdx.y
-                head_idx = blockIdx.x
-                kv_head_idx = head_idx % num_kv_heads
-
-                score = tensor_pointer(f32, [bs, num_heads, max_seq_length], init=score_ptr)
-
-                j = threadIdx.x
-                seq_length = seq_lengths[bs_idx]
-
-                acc = f32.zero
-
-                for k in range(seq_length):
-                    a = score[bs_idx, head_idx, k]
-                    block_idx = cache_blocks[bs_idx, k // block_size]
-                    block_offset = k % block_size
-                    b = value_cache[block_idx, kv_head_idx, j, block_offset]
-                    acc += a * b
-
-                output[bs_idx, head_idx, 0, j] = cast(acc, f16)
-
-            @hidet.script
             def launch(
-                query: f16[bs, num_heads, 1, head_size],
+                query: dtype[bs, num_heads, 1, head_size],
                 seq_lengths: i32[bs],
                 cache_blocks: i32[bs, max_cache_blocks],
-                key_cache: f16[num_blocks, num_kv_heads, head_size, block_size],
-                value_cache: f16[num_blocks, num_kv_heads, head_size, block_size],
-                output: f16[bs, num_heads, 1, head_size],
+                key_cache: dtype[num_blocks, num_kv_heads, head_size, block_size],
+                value_cache: dtype[num_blocks, num_kv_heads, head_size, block_size],
+                output: dtype[bs, num_heads, 1, head_size],
             ):
                 attrs.func_kind = 'public'
 
-                # calculate max_seq_length
-                max_seq_length: i32 = 0
-                seq_lengths_cpu = cast(
-                    runtime.request_cpu_workspace(nbytes=bs * i32.nbytes), dtype=tensor_pointer_type(i32, [bs])
+                page_attention_kernel(
+                    0, 0, # exp_sums, max_logits
+                    output, query, key_cache, value_cache, num_kv_heads, 1.0, 
+                    cache_blocks, 
+                    seq_lengths, 
+                    max_cache_blocks, 
+                    head_size, # q_stride
+                    num_kv_heads * head_size * block_size, # kv_block_stride
+                    head_size * block_size # kv_head_stride 
                 )
-                memcpy(dst=seq_lengths_cpu, src=seq_lengths, count=bs * i32.nbytes, kind='cuda_to_cpu')
-                for i in range(bs):
-                    max_seq_length = max(max_seq_length, seq_lengths_cpu[i])
-
-                # allocate cuda buffers
-                cuda_workspace = cast(
-                    runtime.request_cuda_workspace(nbytes=2 * bs * num_heads * max_seq_length * f32.nbytes), dtype=~u8
-                )
-                score = cast(~cuda_workspace[0], dtype=tensor_pointer_type(f32, [bs, num_heads, max_seq_length]))
-                softmax = cast(
-                    ~cuda_workspace[bs * num_heads * max_seq_length * f32.nbytes],
-                    dtype=tensor_pointer_type(f32, [bs, num_heads, max_seq_length]),
-                )
-
-                # score = query @ key / sqrt(head_size)
-                page_attention_score(max_seq_length, score, query, seq_lengths, cache_blocks, key_cache)
-
-                # softmax(score)
-                page_attention_softmax(max_seq_length, softmax, score, seq_lengths)
-
-                # output = softmax @ value
-                page_attention_output(max_seq_length, output, softmax, seq_lengths, cache_blocks, value_cache)
 
         return script_module.ir_module()
 
@@ -899,7 +772,7 @@ def cache_write(
     return PageAttentionWriteCacheOp(seq_lengths, key, value, cache_slots, key_cache, value_cache).outputs
 
 
-def page_attention(query: Tensor, seq_lengths: Tensor, cache_blocks: Tensor, key_cache: Tensor, value_cache: Tensor):
+def page_attention(query: Tensor, seq_lengths: Tensor, cache_blocks: Tensor, key_cache: Tensor, value_cache: Tensor, max_context_len: int=1024):
     """
     Page attention.
 
@@ -925,4 +798,67 @@ def page_attention(query: Tensor, seq_lengths: Tensor, cache_blocks: Tensor, key
     output: Tensor
         The output tensor. Shape: [bs, num_heads, 1, head_size]
     """
-    return PageAttentionOp(query, seq_lengths, cache_blocks, key_cache, value_cache).outputs[0]
+    return PageAttentionOpV2(query, seq_lengths, cache_blocks, key_cache, value_cache, max_context_len).outputs[0]
+
+# %%
+import torch
+
+def make_inputs_dense(bs=4, num_heads=8, head_size=4, seq_len=64, block_size=16, dtype=torch.float32):
+    num_blocks = bs * seq_len // block_size
+
+    query = torch.randn([bs, num_heads, 1, head_size], device='cuda', dtype=dtype)
+    seq_lengths = torch.full([bs], seq_len, device='cuda', dtype=torch.int)
+    cache_blocks = torch.arange(0, num_blocks, 1, device='cuda', dtype=torch.int).reshape([bs, -1])
+    key_cache = torch.randn([num_blocks, num_heads, head_size, block_size], device='cuda', dtype=dtype)
+    val_cache = torch.randn_like(key_cache)
+    return query, seq_lengths, cache_blocks, key_cache, val_cache
+
+from vllm.model_executor.layers.attention import _paged_attention
+from vllm.model_executor import InputMetadata
+
+def page_attention_vllm(query: Tensor, seq_lengths: Tensor, cache_blocks: Tensor, key_cache: Tensor, value_cache: Tensor, max_context_len: int = 1024, num_kv_heads = None):
+    """
+    query: [bs, num_heads, 1, head_size]
+    key_cache: [num_blocks, num_heads, head_size, block_size]
+    value_cache: [num_blocks, num_heads, head_size, block_size]
+    """
+    bs, nh, _, hs = query.shape
+    x = 16 // torch.tensor([], dtype=query.dtype).element_size()
+    num_blocks, num_heads, head_size, block_size = value_cache.shape
+    if num_kv_heads is None:
+        num_kv_heads = num_heads
+    # key_cache: [num_blocks, num_heads, head_size//x, block_size, x]
+    key_cache = key_cache.view(num_blocks, num_heads, head_size // x, block_size, x)
+    return _paged_attention(
+        query.view(bs, nh, hs), key_cache, value_cache, 
+        InputMetadata(False, None, max_context_len, seq_lengths, cache_blocks, False), num_kv_heads, 1.0, None
+    )
+
+
+import hidet
+from hidet.apps.llm.ops.page_attention import page_attention as hidet_page_attention_
+
+def hidet_page_attention(query: Tensor, seq_lengths: Tensor, cache_blocks: Tensor, key_cache: Tensor, value_cache: Tensor):
+    y = hidet_page_attention_(
+        hidet.from_torch(query).to(hidet.float16), 
+        hidet.from_torch(seq_lengths).to(hidet.float16), 
+        hidet.from_torch(cache_blocks).to(hidet.float16), 
+        hidet.from_torch(key_cache).to(hidet.float16), 
+        hidet.from_torch(value_cache).to(hidet.float16)
+    )
+    return y.torch().to(query.dtype)
+
+def test():
+
+    query, seq_lengths, cache_blocks, key_cache, val_cache = \
+        make_inputs_dense(bs=4, num_heads=8, head_size=64, seq_len=16, block_size=16, dtype=torch.float32)
+    x = 16 // torch.tensor([], dtype=query.dtype).element_size()
+    key_cache_ = key_cache #key_cache.reshape([num_blocks, num_heads, head_size//x, x, block_size]).transpose(-1, -2).reshape([num_blocks, num_heads, head_size, block_size])
+    out1 = page_attention_vllm(query, seq_lengths, cache_blocks, key_cache_, val_cache, max_context_len=1024)
+
+    out2 = hidet_page_attention(query, seq_lengths, cache_blocks, key_cache, val_cache)
+
+    print(out1.shape, out2.shape)
+    print((out1 - out2).abs().max())
+
+test()
