@@ -719,7 +719,7 @@ class PageAttentionOpV2(OpaqueOperator):
                             if block_idx == num_context_blocks - 1:
                                 for j in range(V_VEC_SIZE):
                                     if token_idx + j < context_len:
-                                        cast(~v_vec, ~dtype)[j] = dtype(0.0) # cast(~v_vec, ~dtype)[j]
+                                        cast(~v_vec, ~dtype)[j] = cast(~v_vec, ~dtype)[j]
                                     else:
                                         cast(~v_vec, ~dtype)[j] = dtype(0.0)
                             
@@ -927,7 +927,7 @@ import hidet
 def hidet_page_attention(query: Tensor, seq_lengths: Tensor, cache_blocks: Tensor, key_cache: Tensor, value_cache: Tensor):
     hidet.option.debug_cache_tuning(True)
     hidet.option.cache_dir('zexperiments/cache')
-    hidet.utils.clear_cache_dir()
+    # hidet.utils.clear_cache_dir()
     y = page_attention(
         hidet.from_torch(query), 
         hidet.from_torch(seq_lengths), 
@@ -940,7 +940,7 @@ def hidet_page_attention(query: Tensor, seq_lengths: Tensor, cache_blocks: Tenso
 def test():
 
     query, seq_lengths, cache_blocks, key_cache, val_cache = \
-        make_inputs_dense(bs=1, num_heads=1, head_size=64, seq_len=16, block_size=16, dtype=torch.float32)
+        make_inputs_dense(bs=1, num_heads=8, head_size=64, seq_len=16, block_size=16, dtype=torch.float32)
     x = 16 // torch.tensor([], dtype=query.dtype).element_size()
     key_cache_ = key_cache #key_cache.reshape([num_blocks, num_heads, head_size//x, x, block_size]).transpose(-1, -2).reshape([num_blocks, num_heads, head_size, block_size])
     out1 = page_attention_vllm(query, seq_lengths, cache_blocks, key_cache_, val_cache, max_context_len=1024)
@@ -952,4 +952,17 @@ def test():
     
     return out1, out2
 
-out1, out2 = test()
+# out1, out2 = test()
+
+def test_iter_seq_lens():
+    for seq_len in range(128, 128 * 8):
+        query, seq_lengths, cache_blocks, key_cache, val_cache = \
+            make_inputs_dense(bs=1, num_heads=8, head_size=64, seq_len=seq_len, block_size=16, dtype=torch.float16)
+        out2 = hidet_page_attention(query, seq_lengths, cache_blocks, key_cache, val_cache)
+        x = 16 // torch.tensor([], dtype=query.dtype).element_size()
+        key_cache_ = key_cache #key_cache.reshape([num_blocks, num_heads, head_size//x, x, block_size]).transpose(-1, -2).reshape([num_blocks, num_heads, head_size, block_size])
+        out1 = page_attention_vllm(query, seq_lengths, cache_blocks, key_cache_, val_cache, max_context_len=1024)
+        print("iter", seq_len)
+        print((out1 - out2).abs().max())
+
+# test_iter_seq_lens()

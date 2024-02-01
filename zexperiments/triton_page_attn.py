@@ -280,7 +280,7 @@ def triton_paged_attnv2(query: Tensor, seq_lengths: Tensor, cache_blocks: Tensor
     return out
 
 def make_inputs_dense(bs=4, num_heads=8, head_size=4, seq_len=64, block_size=16, dtype=torch.float32):
-    num_blocks = bs * seq_len // block_size
+    num_blocks = bs * (seq_len + block_size - 1) // block_size
 
     query = torch.randn([bs, num_heads, 1, head_size], device='cuda', dtype=dtype)
     seq_lengths = torch.full([bs], seq_len, device='cuda', dtype=torch.int)
@@ -333,11 +333,18 @@ def test_vllm_correctness():
     print((out0.squeeze() - out1).abs().max())
 
 import hidet
-from hidet.apps.llm.ops.page_attention import page_attention as hidet_page_attention_
+from hidet.apps.llm.ops.page_attention import hidet_page_attention
 
-def hidet_page_attention(query: Tensor, seq_lengths: Tensor, cache_blocks: Tensor, key_cache: Tensor, value_cache: Tensor):
-    y = hidet_page_attention_(hidet.from_torch(query), hidet.from_torch(seq_lengths), hidet.from_torch(cache_blocks), hidet.from_torch(key_cache), hidet.from_torch(value_cache))
-    return y.torch().to(query.dtype)
+# def hidet_page_attention(query: Tensor, seq_lengths: Tensor, cache_blocks: Tensor, key_cache: Tensor, value_cache: Tensor, max_context_len: int = 1024):
+#     y = hidet_page_attention_(
+#         hidet.from_torch(query), 
+#         hidet.from_torch(seq_lengths), 
+#         hidet.from_torch(cache_blocks), 
+#         hidet.from_torch(key_cache), 
+#         hidet.from_torch(value_cache), 
+#         max_context_len=max_context_len
+#     )
+#     return y.torch().to(query.dtype)
 
 def test():
     bs = 1
@@ -399,14 +406,14 @@ if __name__ == '__main__':
     @triton.testing.perf_report(
         triton.testing.Benchmark(
             x_names=['seq'],  # Argument names to use as an x-axis for the plot
-            x_vals=[256 * i for i in range(1, 36)],  # Different possible values for `x_name`
+            x_vals=list(range(128, 700)),  # Different possible values for `x_name`
             line_arg='provider',  # Argument name whose value corresponds to a different line in the plot
             # Possible values for `line_arg`
-            line_vals=['vllm', 'triton', 'tritonv2'],
+            line_vals=['vllm', 'triton', 'tritonv2', 'hidet'],
             # Label name for the lines
-            line_names=["vllm", "Triton", 'tritonv2'],
+            line_names=["vllm", "Triton", 'tritonv2', 'hidet'],
             # Line styles
-            styles=[('green', '-'), ('blue', '-'), ('red', '-')],
+            styles=[('green', '-'), ('blue', '-'), ('red', '-'), ('orange', '-')],
             ylabel="ms",  # Label name for the y-axis
             plot_name=f"bs={bs},nheads={num_heads},hsize={head_size},bsize={block_size}",
             args={},
@@ -420,6 +427,8 @@ if __name__ == '__main__':
             ms, min_ms, max_ms = triton.testing.do_bench(lambda: triton_paged_attn(*args), quantiles=quantiles)
         if provider == 'tritonv2':
             ms, min_ms, max_ms = triton.testing.do_bench(lambda: triton_paged_attnv2(*args), quantiles=quantiles)
+        if provider == 'hidet':
+            ms, min_ms, max_ms = triton.testing.do_bench(lambda: hidet_page_attention(*args), quantiles=quantiles)
         # perf = lambda ms: 2 * M * N * K * 1e-12 / (ms * 1e-3)
         # return perf(ms), perf(max_ms), perf(min_ms)
         return ms, max_ms, min_ms
