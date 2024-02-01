@@ -423,10 +423,11 @@ class PageAttentionOpV2(OpaqueOperator):
         import hidet
         from hidet.lang import attrs, cast, printf, shared_tensor
         from hidet.lang.types import u8, f16, f32, i32, i64, register_tensor, tensor_pointer_type, tensor_pointer
+        from hidet.lang.types import int8, int16, int32, int64
         from hidet.lang.cuda import memcpy, blockIdx, threadIdx, shfl_down_sync, shfl_xor_sync, shfl_sync, syncthreads, dynamic_shared_memory, blockDim, gridDim
         from hidet.ir.primitives.math import exp, sqrt
         from hidet.ir.primitives import runtime
-        from hidet.ir.dtypes.vector import vectorize
+        from hidet.ir.dtypes.vector import vectorize, float32x2, float32x4
 
         _query, _seq_lengths, _cache_blocks, _key_cache, _value_cache = self.inputs
         dtype = self.inputs[0].dtype
@@ -449,8 +450,11 @@ class PageAttentionOpV2(OpaqueOperator):
         outputs_size = (NUM_WARPS // 2) * head_size * dtype.nbytes
         shared_mem_size = max(logits_size, outputs_size)
         
-        vec_dtype = vectorize(dtype, VEC_SIZE)
-        v_vec_dtype = vectorize(dtype, V_VEC_SIZE)
+        # only the bitwidths matter, this should be done more cleanly
+        vec_table = {1: int8, 2: int16, 4: int32, 8: int64, 16: float32x4}
+        vectorize_integral = lambda dtype, size: vec_table[dtype.nbytes * size]
+        vec_dtype = vectorize_integral(dtype, VEC_SIZE)
+        v_vec_dtype = vectorize_integral(dtype, V_VEC_SIZE)
 
         assert int(32 % block_size) == 0
         with hidet.script_module() as script_module:
@@ -538,17 +542,17 @@ class PageAttentionOpV2(OpaqueOperator):
                 max_num_partitions = gridDim.z
                 context_len = context_lens[seq_idx]
 
-                use_partitioning = partition_size > 0
-                if use_partitioning and partition_idx * partition_size >= context_len:
+                USE_PARTITIONING = partition_size > 0
+                if USE_PARTITIONING and partition_idx * partition_size >= context_len:
                     return
                 
                 num_context_blocks = (context_len + block_size - 1) // block_size
                 num_blocks_per_partition = num_context_blocks
-                if use_partitioning:
+                if USE_PARTITIONING:
                     num_blocks_per_partition = partition_size // block_size
                 
                 start_block_idx = 0
-                if use_partitioning:
+                if USE_PARTITIONING:
                     start_block_idx = partition_idx * num_blocks_per_partition
                 end_block_idx = min(start_block_idx + num_blocks_per_partition, num_context_blocks)
                 num_blocks = end_block_idx - start_block_idx
@@ -569,8 +573,6 @@ class PageAttentionOpV2(OpaqueOperator):
                 num_heads = gridDim.x
                 num_queries_per_kv = num_heads // num_kv_heads
                 kv_head_idx = head_idx // num_queries_per_kv
-
-                
 
                 thread_group_idx = thread_idx // THREAD_GROUP_SIZE
                 thread_group_offset = thread_idx % THREAD_GROUP_SIZE
@@ -620,7 +622,14 @@ class PageAttentionOpV2(OpaqueOperator):
                             qk_max = qk_max if mask else max(qk_max, qk)
                     
                     block_idx += NUM_WARPS
-                    
+                
+
+                # syncthreads()
+                # if thread_idx == 0:
+                #     for i in range(context_len):
+                #         printf("%f ", logits[i])
+                # syncthreads()
+
                 m1 = WARP_SIZE // 2
                 while m1 >= THREAD_GROUP_SIZE:
                     qk_max = max(qk_max, shfl_xor_sync(0xFFFFFFFF, qk_max, m1))
@@ -648,7 +657,11 @@ class PageAttentionOpV2(OpaqueOperator):
                 
                 exp_sum = block_sum(~red_smem[NUM_WARPS], exp_sum)
 
+                # syncthreads()
+                # printf("(%d: %f) ", thread_idx, exp_sum)
+                # syncthreads()
                 inv_sum = 1 / (exp_sum + 1e-6)
+                
                 # for i in range(thread_idx, num_tokens, num_threads):
                 i3 = thread_idx
                 while i3 < num_tokens:
@@ -657,7 +670,7 @@ class PageAttentionOpV2(OpaqueOperator):
                 
                 syncthreads()
 
-                if use_partitioning and thread_idx == 0:
+                if USE_PARTITIONING and thread_idx == 0:
                     max_logits_ptr = max_logits + seq_idx * num_heads * max_num_partitions + head_idx * max_num_partitions + partition_idx
                     max_logits_ptr[0] = qk_max
                     exp_sums_ptr = exp_sums + seq_idx * num_heads * max_num_partitions + head_idx * max_num_partitions + partition_idx
@@ -676,27 +689,36 @@ class PageAttentionOpV2(OpaqueOperator):
                 block_idx = start_block_idx + warp_idx
                 while block_idx < end_block_idx:
                     physical_block_number = cast(block_table[block_idx], i64)
-                    physical_block_offset = (lane // NUM_V_VECS_PER_ROW) * V_VEC_SIZE
+                    physical_block_offset = (lane % NUM_V_VECS_PER_ROW) * V_VEC_SIZE
                     token_idx = block_idx * block_size + physical_block_offset
                     logits_vec = cast(logits + token_idx - start_token_idx, ~v_vec_dtype)[0]
 
                     v_ptr = v_cache + physical_block_number * kv_block_stride + kv_head_idx * kv_head_stride
 
                     for i in range(NUM_ROWS_PER_THREAD):
-                        row_idx = lane / NUM_V_VECS_PER_ROW + i * NUM_ROWS_PER_ITER
+                        row_idx = lane // NUM_V_VECS_PER_ROW + i * NUM_ROWS_PER_ITER
                         if row_idx < head_size:
                             offset = row_idx * block_size + physical_block_offset
                             v_vec = cast(v_ptr + offset, ~v_vec_dtype)[0]
                             if block_idx == num_context_blocks - 1:
                                 for j in range(V_VEC_SIZE):
-                                    if token_idx + j >= context_len:
+                                    if token_idx + j < context_len:
+                                        cast(~v_vec, ~dtype)[j] = cast(~v_vec, ~dtype)[j]
+                                    else:
                                         cast(~v_vec, ~dtype)[j] = dtype.zero
                             
                             # accs[i] += dot(~logits_vec, ~v_vec)
                             for j in range(V_VEC_SIZE):
                                 accs[i] += cast(~logits_vec, ~dtype)[j] * cast(~v_vec, ~dtype)[j]
-                    
+                                # printf("accs[%d][%i]: %f ", thread_idx, i, accs[i])
+                                # if token_idx + j < context_len:
+                                #     accs[i] += 1.0 / f32(context_len)# * cast(~v_vec, ~dtype)[j]
+
                     block_idx += NUM_WARPS
+                
+                # syncthreads()
+                # printf("(%d: %f) ", thread_idx, accs[0])
+                # syncthreads()
 
                 for i in range(NUM_ROWS_PER_THREAD):
                     acc = accs[i]
@@ -706,12 +728,19 @@ class PageAttentionOpV2(OpaqueOperator):
                         m1 //= 2
                     accs[i] = acc
                 
+                # syncthreads()
+                # if thread_idx == 0:
+                #     printf("\n")
+                # syncthreads()
+                # printf("(%d: %f) ", thread_idx, accs[0])
+                # syncthreads()
+                    
                 syncthreads()
 
                 out_smem = cast(logits, ~f32)
 
                 m1 = NUM_WARPS
-                while m1 >= 1:
+                while m1 > 1:
                     mid = m1 // 2
 
                     if warp_idx >= mid and warp_idx < m1:
@@ -720,7 +749,7 @@ class PageAttentionOpV2(OpaqueOperator):
                         for j in range(NUM_ROWS_PER_THREAD):
                             row_idx = lane // NUM_V_VECS_PER_ROW + j * NUM_ROWS_PER_ITER
                             if row_idx < head_size and lane % NUM_V_VECS_PER_ROW == 0:
-                                dst[row_idx] = accs[m1]
+                                dst[row_idx] = accs[j]
                 
                     syncthreads()
 
@@ -729,14 +758,21 @@ class PageAttentionOpV2(OpaqueOperator):
                         for j in range(NUM_ROWS_PER_THREAD):
                             row_idx = lane // NUM_V_VECS_PER_ROW + j * NUM_ROWS_PER_ITER
                             if row_idx < head_size and lane % NUM_V_VECS_PER_ROW == 0:
-                                accs[m1] += src[row_idx]
+                                accs[j] += src[row_idx]
                     
                     syncthreads()
 
                     m1 //= 2
                 
+                # syncthreads()
+                # if thread_idx == 0:
+                #     printf("\n")
+                # syncthreads()
+                # printf("(%d: %f) ", thread_idx, accs[0])
+                # syncthreads()
+
                 if warp_idx == 0:
-                    out_ptr = out + seq_idx * num_heads * head_size + head_idx * max_num_partitions * head_size + partition_idx * head_size
+                    out_ptr = out + seq_idx * max_num_partitions * num_heads * head_size + head_idx * max_num_partitions * head_size + partition_idx * head_size
 
                     for i in range(NUM_ROWS_PER_THREAD):
                         row_idx = lane // NUM_V_VECS_PER_ROW + i * NUM_ROWS_PER_ITER
@@ -760,7 +796,7 @@ class PageAttentionOpV2(OpaqueOperator):
                     cache_blocks, 
                     seq_lengths, 
                     max_cache_blocks, 
-                    head_size, # q_stride
+                    num_heads_ * head_size, # q_stride
                     num_kv_heads * head_size * block_size, # kv_block_stride
                     head_size * block_size # kv_head_stride 
                 )
@@ -830,7 +866,7 @@ def page_attention(query: Tensor, seq_lengths: Tensor, cache_blocks: Tensor, key
 import torch
 
 def make_inputs_dense(bs=4, num_heads=8, head_size=4, seq_len=64, block_size=16, dtype=torch.float32):
-    num_blocks = bs * seq_len // block_size
+    num_blocks = (bs * seq_len + block_size - 1) // block_size
 
     query = torch.randn([bs, num_heads, 1, head_size], device='cuda', dtype=dtype)
     seq_lengths = torch.full([bs], seq_len, device='cuda', dtype=torch.int)
@@ -865,12 +901,13 @@ import hidet
 
 def hidet_page_attention(query: Tensor, seq_lengths: Tensor, cache_blocks: Tensor, key_cache: Tensor, value_cache: Tensor):
     hidet.option.debug_cache_tuning(True)
-    hidet.option.cache_dir('zexperiments/cache')
+    # hidet.option.cache_dir('zexperiments/cache')
+    hidet.utils.clear_cache_dir()
     y = page_attention(
         hidet.from_torch(query), 
         hidet.from_torch(seq_lengths), 
         hidet.from_torch(cache_blocks), 
-        hidet.from_torch(key_cache), 
+        hidet.from_torch(key_cache),
         hidet.from_torch(value_cache)
     )
     return y.torch().to(query.dtype).squeeze()
@@ -878,7 +915,7 @@ def hidet_page_attention(query: Tensor, seq_lengths: Tensor, cache_blocks: Tenso
 def test():
 
     query, seq_lengths, cache_blocks, key_cache, val_cache = \
-        make_inputs_dense(bs=4, num_heads=8, head_size=64, seq_len=16, block_size=16, dtype=torch.float32)
+        make_inputs_dense(bs=4, num_heads=8, head_size=64, seq_len=128, block_size=16, dtype=torch.float16)
     x = 16 // torch.tensor([], dtype=query.dtype).element_size()
     key_cache_ = key_cache #key_cache.reshape([num_blocks, num_heads, head_size//x, x, block_size]).transpose(-1, -2).reshape([num_blocks, num_heads, head_size, block_size])
     out1 = page_attention_vllm(query, seq_lengths, cache_blocks, key_cache_, val_cache, max_context_len=1024)
