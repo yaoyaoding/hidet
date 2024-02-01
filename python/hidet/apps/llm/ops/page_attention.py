@@ -455,6 +455,13 @@ class PageAttentionOpV2(OpaqueOperator):
         vectorize_integral = lambda dtype, size: vec_table[dtype.nbytes * size]
         vec_dtype = vectorize_integral(dtype, VEC_SIZE)
         v_vec_dtype = vectorize_integral(dtype, V_VEC_SIZE)
+        if f32.nbytes * V_VEC_SIZE > 16:
+            v_vec_logit_dtype = float32x4
+            v_vec_logit_loads = f32.nbytes * V_VEC_SIZE // 16
+        else:
+            v_vec_logit_dtype = vectorize_integral(f32, V_VEC_SIZE)
+            v_vec_logit_loads = 1
+        
 
         assert int(32 % block_size) == 0
         with hidet.script_module() as script_module:
@@ -685,16 +692,25 @@ class PageAttentionOpV2(OpaqueOperator):
                 for i in range(NUM_ROWS_PER_THREAD):
                     accs[i] = 0.0
                 
+                # for i in range(NUM_ROWS_PER_THREAD):
+                #     printf("(%d: %f) ", thread_idx, accs[i])
+                
                 # for block_idx in range(start_block_idx + warp_idx, end_block_idx, NUM_WARPS):
                 block_idx = start_block_idx + warp_idx
                 while block_idx < end_block_idx:
                     physical_block_number = cast(block_table[block_idx], i64)
                     physical_block_offset = (lane % NUM_V_VECS_PER_ROW) * V_VEC_SIZE
                     token_idx = block_idx * block_size + physical_block_offset
-                    logits_vec = cast(logits + token_idx - start_token_idx, ~v_vec_dtype)[0]
+                    logits_vec = register_tensor(v_vec_logit_dtype, [v_vec_logit_loads])
+                    for i in range(v_vec_logit_loads):
+                        logits_vec[i] = cast(logits + token_idx - start_token_idx, ~v_vec_logit_dtype)[i]
 
                     v_ptr = v_cache + physical_block_number * kv_block_stride + kv_head_idx * kv_head_stride
 
+                    # nan = 0.0
+                    # nan /= 0.0
+                    # if threadIdx.x == 0:
+                    #     printf("nan %f \n", -nan)
                     for i in range(NUM_ROWS_PER_THREAD):
                         row_idx = lane // NUM_V_VECS_PER_ROW + i * NUM_ROWS_PER_ITER
                         if row_idx < head_size:
@@ -703,14 +719,23 @@ class PageAttentionOpV2(OpaqueOperator):
                             if block_idx == num_context_blocks - 1:
                                 for j in range(V_VEC_SIZE):
                                     if token_idx + j < context_len:
-                                        cast(~v_vec, ~dtype)[j] = cast(~v_vec, ~dtype)[j]
+                                        cast(~v_vec, ~dtype)[j] = dtype(0.0) # cast(~v_vec, ~dtype)[j]
                                     else:
-                                        cast(~v_vec, ~dtype)[j] = dtype.zero
+                                        cast(~v_vec, ~dtype)[j] = dtype(0.0)
                             
                             # accs[i] += dot(~logits_vec, ~v_vec)
                             for j in range(V_VEC_SIZE):
-                                accs[i] += cast(~logits_vec, ~dtype)[j] * cast(~v_vec, ~dtype)[j]
-                                # printf("accs[%d][%i]: %f ", thread_idx, i, accs[i])
+                                lv = cast(~logits_vec, ~f32)[j]
+                                rv = cast(cast(~v_vec, ~dtype)[j], f32)
+                                k = lv * rv
+                                # assert cast(cast(~v_vec, ~dtype)[j], f32) != nan
+                                # assert cast(~logits_vec, ~f32)[j] != nan
+                                # assert k != nan
+                                accs[i] += k
+                                # assert accs[i] != nan
+
+                                # printf("accs[%d][%i]: %f %f %f\n", thread_idx, i, k, lv, rv)
+
                                 # if token_idx + j < context_len:
                                 #     accs[i] += 1.0 / f32(context_len)# * cast(~v_vec, ~dtype)[j]
 
@@ -901,7 +926,7 @@ import hidet
 
 def hidet_page_attention(query: Tensor, seq_lengths: Tensor, cache_blocks: Tensor, key_cache: Tensor, value_cache: Tensor):
     hidet.option.debug_cache_tuning(True)
-    # hidet.option.cache_dir('zexperiments/cache')
+    hidet.option.cache_dir('zexperiments/cache')
     hidet.utils.clear_cache_dir()
     y = page_attention(
         hidet.from_torch(query), 
@@ -915,7 +940,7 @@ def hidet_page_attention(query: Tensor, seq_lengths: Tensor, cache_blocks: Tenso
 def test():
 
     query, seq_lengths, cache_blocks, key_cache, val_cache = \
-        make_inputs_dense(bs=4, num_heads=8, head_size=64, seq_len=128, block_size=16, dtype=torch.float16)
+        make_inputs_dense(bs=1, num_heads=1, head_size=64, seq_len=16, block_size=16, dtype=torch.float32)
     x = 16 // torch.tensor([], dtype=query.dtype).element_size()
     key_cache_ = key_cache #key_cache.reshape([num_blocks, num_heads, head_size//x, x, block_size]).transpose(-1, -2).reshape([num_blocks, num_heads, head_size, block_size])
     out1 = page_attention_vllm(query, seq_lengths, cache_blocks, key_cache_, val_cache, max_context_len=1024)

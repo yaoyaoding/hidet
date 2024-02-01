@@ -336,7 +336,7 @@ import hidet
 from hidet.apps.llm.ops.page_attention import page_attention as hidet_page_attention_
 
 def hidet_page_attention(query: Tensor, seq_lengths: Tensor, cache_blocks: Tensor, key_cache: Tensor, value_cache: Tensor):
-    y = hidet_page_attention_(hidet.from_torch(query).to(hidet.float16), hidet.from_torch(seq_lengths).to(hidet.float16), hidet.from_torch(cache_blocks).to(hidet.float16), hidet.from_torch(key_cache).to(hidet.float16), hidet.from_torch(value_cache).to(hidet.float16))
+    y = hidet_page_attention_(hidet.from_torch(query), hidet.from_torch(seq_lengths), hidet.from_torch(cache_blocks), hidet.from_torch(key_cache), hidet.from_torch(value_cache))
     return y.torch().to(query.dtype)
 
 def test():
@@ -371,7 +371,7 @@ def test():
     key_cache_ = key_cache.reshape([num_blocks, num_heads, head_size//x, x, block_size]).transpose(-1, -2).reshape([num_blocks, num_heads, head_size, block_size])
     out3 = page_attention_vllm(query, seq_lengths, cache_blocks, key_cache_, val_cache, max_context_len=seq_len)
 
-    # out5 = hidet_page_attention(query, seq_lengths, cache_blocks, key_cache, val_cache)
+    out5 = hidet_page_attention(query, seq_lengths, cache_blocks, key_cache, val_cache)
 
     print((out0.squeeze() - out3).abs().max())
     # print((out1.squeeze() - out3).abs().max())
@@ -379,7 +379,7 @@ def test():
 
     print((out4.squeeze() - out3).abs().max())
 
-    # print((out5.squeeze() - out3).abs().max())
+    print((out5.squeeze() - out3).abs().max())
     # print((out4.squeeze() - out3).abs())
 
 test()
