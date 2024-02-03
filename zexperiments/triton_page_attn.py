@@ -307,7 +307,7 @@ def page_attention_vllm(query: Tensor, seq_lengths: Tensor, cache_blocks: Tensor
     key_cache = key_cache.view(num_blocks, num_heads, head_size // x, block_size, x)
     return _paged_attention(
         query.view(bs, nh, hs), key_cache, value_cache, 
-        InputMetadata(False, None, max_context_len, seq_lengths, cache_blocks, False), num_kv_heads, 1.0, None
+        InputMetadata(False, None, None, max_context_len, None, max_context_len, seq_lengths, cache_blocks, False, 'auto'), num_kv_heads, 1.0, None
     )
 
 
@@ -333,7 +333,7 @@ def test_vllm_correctness():
     print((out0.squeeze() - out1).abs().max())
 
 import hidet
-from hidet.apps.llm.ops.page_attention import hidet_page_attention
+from hidet.apps.llm.ops.page_attention import page_attention as hidet_page_attention_
 
 # def hidet_page_attention(query: Tensor, seq_lengths: Tensor, cache_blocks: Tensor, key_cache: Tensor, value_cache: Tensor, max_context_len: int = 1024):
 #     y = hidet_page_attention_(
@@ -378,7 +378,7 @@ def test():
     key_cache_ = key_cache.reshape([num_blocks, num_heads, head_size//x, x, block_size]).transpose(-1, -2).reshape([num_blocks, num_heads, head_size, block_size])
     out3 = page_attention_vllm(query, seq_lengths, cache_blocks, key_cache_, val_cache, max_context_len=seq_len)
 
-    out5 = hidet_page_attention(query, seq_lengths, cache_blocks, key_cache, val_cache)
+    # out5 = hidet_page_attention(query, seq_lengths, cache_blocks, key_cache, val_cache, max_context_len=seq_len)
 
     print((out0.squeeze() - out3).abs().max())
     # print((out1.squeeze() - out3).abs().max())
@@ -386,27 +386,23 @@ def test():
 
     print((out4.squeeze() - out3).abs().max())
 
-    print((out5.squeeze() - out3).abs().max())
+    # print((out5.squeeze() - out3).abs().max())
     # print((out4.squeeze() - out3).abs())
 
-test()
-
-# %%
-args = make_inputs_dense(head_size=64)
-page_attention_vllm(*args, num_kv_heads=16)
-
-# %%
+# test()
 
 if __name__ == '__main__':
-    bs = 4
-    num_heads = 8
-    head_size = 64
+    hidet.option.cache_dir('zpageattn_cache')
+    # hidet.utils.clear_cache_dir()
+    bs = 1
+    num_heads = 12
+    head_size = 128
     block_size = 16
 
     @triton.testing.perf_report(
         triton.testing.Benchmark(
             x_names=['seq'],  # Argument names to use as an x-axis for the plot
-            x_vals=list(range(128, 700)),  # Different possible values for `x_name`
+            x_vals=list(range(128, 4097, 128)),  # Different possible values for `x_name`
             line_arg='provider',  # Argument name whose value corresponds to a different line in the plot
             # Possible values for `line_arg`
             line_vals=['vllm', 'triton', 'tritonv2', 'hidet'],
@@ -419,7 +415,7 @@ if __name__ == '__main__':
             args={},
         ))
     def benchmark(seq, provider):
-        args = make_inputs_dense(bs, num_heads, head_size, seq, block_size, dtype=torch.float16)
+        args = make_inputs_dense(bs, num_heads, head_size, seq, block_size, dtype=torch.float32)
         quantiles = [0.5, 0.2, 0.8]
         if provider == 'vllm':
             ms, min_ms, max_ms = triton.testing.do_bench(lambda: page_attention_vllm(*args, max_context_len=seq), quantiles=quantiles)
@@ -428,7 +424,13 @@ if __name__ == '__main__':
         if provider == 'tritonv2':
             ms, min_ms, max_ms = triton.testing.do_bench(lambda: triton_paged_attnv2(*args), quantiles=quantiles)
         if provider == 'hidet':
-            ms, min_ms, max_ms = triton.testing.do_bench(lambda: hidet_page_attention(*args), quantiles=quantiles)
+            args = [hidet.from_torch(x) for x in args]
+            sargs = [hidet.symbol_like(x) for x in args]
+            sout = hidet_page_attention_(*sargs, max_context_len=seq)
+            g = hidet.trace_from(sout, inputs=sargs)
+            gopt = hidet.graph.optimize(g)
+            cg = gopt.build(space=2)
+            ms, min_ms, max_ms = triton.testing.do_bench(lambda: cg(*args), quantiles=quantiles)
         # perf = lambda ms: 2 * M * N * K * 1e-12 / (ms * 1e-3)
         # return perf(ms), perf(max_ms), perf(min_ms)
         return ms, max_ms, min_ms
@@ -441,3 +443,5 @@ if __name__ == '__main__':
 #     print(k, v)
 # for k, v in page_attn_kernel.configs_timings.items():
 #     print(k, v)
+
+# %%

@@ -445,8 +445,8 @@ class PageAttentionOpV2(OpaqueOperator):
         NUM_TOKENS_PER_THREAD_GROUP = (block_size + WARP_SIZE - 1) // WARP_SIZE
         NUM_WARPS = num_threads // WARP_SIZE
 
-        padded_context_len = (self.attrs['max_context_len'] // block_size) * block_size
-        logits_size = padded_context_len * dtype.nbytes
+        padded_context_len = ((self.attrs['max_context_len'] + block_size - 1) // block_size) * block_size
+        logits_size = padded_context_len * f32.nbytes
         outputs_size = (NUM_WARPS // 2) * head_size * dtype.nbytes
         shared_mem_size = max(logits_size, outputs_size)
         
@@ -606,7 +606,8 @@ class PageAttentionOpV2(OpaqueOperator):
                 # for block_idx in range(start_block_idx + warp_idx, end_block_idx, NUM_WARPS):
                 block_idx = start_block_idx + warp_idx
                 while block_idx < end_block_idx:
-                    physical_block_number = cast(block_table[block_idx], i64)
+                    physical_block_number = int64(0)
+                    physical_block_number = block_table[block_idx]
 
                     for i in range(NUM_TOKENS_PER_THREAD_GROUP):
                         physical_block_offset = (thread_group_idx + i * WARP_SIZE) % block_size
@@ -630,7 +631,6 @@ class PageAttentionOpV2(OpaqueOperator):
                     
                     block_idx += NUM_WARPS
                 
-
                 # syncthreads()
                 # if thread_idx == 0:
                 #     for i in range(context_len):
@@ -924,23 +924,24 @@ def page_attention_vllm(query: Tensor, seq_lengths: Tensor, cache_blocks: Tensor
 
 import hidet
 
-def hidet_page_attention(query: Tensor, seq_lengths: Tensor, cache_blocks: Tensor, key_cache: Tensor, value_cache: Tensor):
-    hidet.option.debug_cache_tuning(True)
+def hidet_page_attention(query: Tensor, seq_lengths: Tensor, cache_blocks: Tensor, key_cache: Tensor, value_cache: Tensor, max_context_len: int = 1024):
     hidet.option.cache_dir('zexperiments/cache')
-    # hidet.utils.clear_cache_dir()
+    hidet.utils.clear_cache_dir()
+    hidet.option.debug_cache_tuning(True)
     y = page_attention(
         hidet.from_torch(query), 
         hidet.from_torch(seq_lengths), 
         hidet.from_torch(cache_blocks), 
         hidet.from_torch(key_cache),
-        hidet.from_torch(value_cache)
+        hidet.from_torch(value_cache),
+        max_context_len=max_context_len
     )
     return y.torch().to(query.dtype).squeeze()
 
 def test():
 
     query, seq_lengths, cache_blocks, key_cache, val_cache = \
-        make_inputs_dense(bs=1, num_heads=8, head_size=64, seq_len=16, block_size=16, dtype=torch.float32)
+        make_inputs_dense(bs=1, num_heads=1, head_size=64, seq_len=785, block_size=16, dtype=torch.float16)
     x = 16 // torch.tensor([], dtype=query.dtype).element_size()
     key_cache_ = key_cache #key_cache.reshape([num_blocks, num_heads, head_size//x, x, block_size]).transpose(-1, -2).reshape([num_blocks, num_heads, head_size, block_size])
     out1 = page_attention_vllm(query, seq_lengths, cache_blocks, key_cache_, val_cache, max_context_len=1024)
@@ -952,7 +953,6 @@ def test():
     
     return out1, out2
 
-# out1, out2 = test()
 
 def test_iter_seq_lens():
     for seq_len in range(128, 128 * 8):
@@ -961,8 +961,10 @@ def test_iter_seq_lens():
         out2 = hidet_page_attention(query, seq_lengths, cache_blocks, key_cache, val_cache)
         x = 16 // torch.tensor([], dtype=query.dtype).element_size()
         key_cache_ = key_cache #key_cache.reshape([num_blocks, num_heads, head_size//x, x, block_size]).transpose(-1, -2).reshape([num_blocks, num_heads, head_size, block_size])
-        out1 = page_attention_vllm(query, seq_lengths, cache_blocks, key_cache_, val_cache, max_context_len=1024)
+        out1 = page_attention_vllm(query, seq_lengths, cache_blocks, key_cache_, val_cache, max_context_len=max(1024, seq_len))
         print("iter", seq_len)
         print((out1 - out2).abs().max())
 
-# test_iter_seq_lens()
+if __name__ == '__main__':
+    out1, out2 = test()
+    # test_iter_seq_lens()
