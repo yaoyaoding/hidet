@@ -44,8 +44,10 @@ def page_attention_ref(
         seq_value = torch.cat(seq_value_list, dim=-1)[:, :, :seq_length]  # [num_kv_heads, head_size, seq_length]
         if num_heads != num_kv_heads:
             assert num_heads % num_kv_heads == 0
-            seq_key   = seq_key.repeat_interleave(num_heads // num_kv_heads, dim=0)  # [num_heads, head_size, seq_length]
-            seq_value = seq_value.repeat_interleave(num_heads // num_kv_heads, dim=0)  # [num_heads, head_size, seq_length]
+            seq_key = seq_key.repeat_interleave(num_heads // num_kv_heads, dim=0)  # [num_heads, head_size, seq_length]
+            seq_value = seq_value.repeat_interleave(
+                num_heads // num_kv_heads, dim=0
+            )  # [num_heads, head_size, seq_length]
 
         seq_query = seq_query.unsqueeze(1)  # [num_heads, 1, head_size]
         seq_value = seq_value.transpose(1, 2)  # [num_heads, seq_length, head_size]
@@ -84,12 +86,8 @@ def test_page_attention(num_heads, num_kv_heads, block_size, head_size, seq_leng
     query = from_torch(torch.randn(bs, num_heads, 1, head_size, dtype=dtype, device='cuda'))
     seq_lengths = from_torch(torch.tensor(seq_lengths_list, dtype=torch.int32, device='cuda'))
     cache_blocks = from_torch(torch.tensor(cache_blocks_list, dtype=torch.int32, device='cuda'))
-    key_cache = from_torch(
-        torch.randn(num_blocks, num_kv_heads, head_size, block_size, dtype=dtype, device='cuda')
-    )
-    value_cache = from_torch(
-        torch.randn(num_blocks, num_kv_heads, head_size, block_size, dtype=dtype, device='cuda')
-    )
+    key_cache = from_torch(torch.randn(num_blocks, num_kv_heads, head_size, block_size, dtype=dtype, device='cuda'))
+    value_cache = from_torch(torch.randn(num_blocks, num_kv_heads, head_size, block_size, dtype=dtype, device='cuda'))
 
     # run reference implementation
     output_ref = page_attention_ref(query, seq_lengths, cache_blocks, key_cache, value_cache)
