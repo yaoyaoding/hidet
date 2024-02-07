@@ -1,3 +1,4 @@
+# %%
 from typing import List
 import pytest
 import math
@@ -23,8 +24,12 @@ def page_attention_ref(
     num_kv_heads = key_cache.size(1)
     head_size = query.size(3)
     block_size = key_cache.size(-1)
+    max_num_blocks = key_cache.size(0)
     outputs = []
 
+    x = 16 // torch.tensor([], dtype=query.dtype).element_size()
+    key_cache = key_cache.reshape(max_num_blocks, num_kv_heads, head_size // x, block_size, x)
+    key_cache = key_cache.permute(0, 1, 2, 4, 3).reshape(max_num_blocks, num_kv_heads, head_size, block_size)
     for i in range(bs):
         seq_query = query[i, :, 0, :]  # [num_heads, head_size]
         seq_key_list = []
@@ -39,8 +44,8 @@ def page_attention_ref(
         seq_value = torch.cat(seq_value_list, dim=-1)[:, :, :seq_length]  # [num_kv_heads, head_size, seq_length]
         if num_heads != num_kv_heads:
             assert num_heads % num_kv_heads == 0
-            seq_key = seq_key.repeat(num_heads // num_kv_heads, 1, 1)  # [num_heads, head_size, seq_length]
-            seq_value = seq_value.repeat(num_heads // num_kv_heads, 1, 1)  # [num_heads, head_size, seq_length]
+            seq_key   = seq_key.repeat_interleave(num_heads // num_kv_heads, dim=0)  # [num_heads, head_size, seq_length]
+            seq_value = seq_value.repeat_interleave(num_heads // num_kv_heads, dim=0)  # [num_heads, head_size, seq_length]
 
         seq_query = seq_query.unsqueeze(1)  # [num_heads, 1, head_size]
         seq_value = seq_value.transpose(1, 2)  # [num_heads, seq_length, head_size]
@@ -56,7 +61,8 @@ def page_attention_ref(
 @pytest.mark.parametrize('num_heads, num_kv_heads', [(32, 1), (32, 32), (64, 8)])
 @pytest.mark.parametrize('block_size, head_size', [(4, 32), (16, 64), (32, 128)])
 @pytest.mark.parametrize('seq_lengths_list', [[1, 2, 300, 448, 5, 683, 791, 88, 9]])
-def test_page_attention(num_heads, num_kv_heads, block_size, head_size, seq_lengths_list: List[int]):
+@pytest.mark.parametrize('dtype', [torch.float32, torch.float16])
+def test_page_attention(num_heads, num_kv_heads, block_size, head_size, seq_lengths_list: List[int], dtype):
     bs = len(seq_lengths_list)
     cache_blocks_list = []
     max_num_blocks = max((seq_length + block_size - 1) // block_size for seq_length in seq_lengths_list)
@@ -75,14 +81,14 @@ def test_page_attention(num_heads, num_kv_heads, block_size, head_size, seq_leng
     num_blocks = current_block
 
     # generate inputs
-    query = from_torch(torch.randn(bs, num_heads, 1, head_size, dtype=torch.float16, device='cuda'))
+    query = from_torch(torch.randn(bs, num_heads, 1, head_size, dtype=dtype, device='cuda'))
     seq_lengths = from_torch(torch.tensor(seq_lengths_list, dtype=torch.int32, device='cuda'))
     cache_blocks = from_torch(torch.tensor(cache_blocks_list, dtype=torch.int32, device='cuda'))
     key_cache = from_torch(
-        torch.randn(num_blocks, num_kv_heads, head_size, block_size, dtype=torch.float16, device='cuda')
+        torch.randn(num_blocks, num_kv_heads, head_size, block_size, dtype=dtype, device='cuda')
     )
     value_cache = from_torch(
-        torch.randn(num_blocks, num_kv_heads, head_size, block_size, dtype=torch.float16, device='cuda')
+        torch.randn(num_blocks, num_kv_heads, head_size, block_size, dtype=dtype, device='cuda')
     )
 
     # run reference implementation
@@ -93,7 +99,10 @@ def test_page_attention(num_heads, num_kv_heads, block_size, head_size, seq_leng
     output_our = page_attention(query, seq_lengths, cache_blocks, key_cache, value_cache)
     torch.cuda.synchronize()
 
-    hidet.utils.assert_close(output_our, output_ref, rtol=1e-2, atol=1e-2)
+    if dtype == torch.float16:
+        hidet.utils.assert_close(output_our, output_ref, rtol=1e-2, atol=1e-2)
+    else:
+        hidet.utils.assert_close(output_our, output_ref)
 
 
 if __name__ == '__main__':

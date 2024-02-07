@@ -399,7 +399,7 @@ class PageAttentionOpV2(OpaqueOperator):
                 'key_cache': key_cache,
                 'value_cache': value_cache,
             },
-            attributes={'max_context_len': max_context_len}
+            attributes={'max_context_len': max_context_len, 'qk_scale': query.shape[-1] ** -0.5}
         )
 
     def symbolic_forward(
@@ -432,6 +432,7 @@ class PageAttentionOpV2(OpaqueOperator):
         _query, _seq_lengths, _cache_blocks, _key_cache, _value_cache = self.inputs
         dtype = self.inputs[0].dtype
 
+        qk_scale = self.attrs['qk_scale']
         bs, num_heads_, _, head_size = self.inputs[0].shape
         max_cache_blocks = _cache_blocks.shape[-1]
         num_blocks, num_kv_heads, head_size, block_size = _key_cache.shape
@@ -622,7 +623,7 @@ class PageAttentionOpV2(OpaqueOperator):
                             k_ptr_1 = k_ptr + offset1 * block_size * x + offset2
                             k_vecs[j] = cast(k_ptr_1, ~vec_dtype)[0]
 
-                        qk = qk_dot(~q_vecs[thread_group_offset][0], ~k_vecs[0])
+                        qk = scale * qk_dot(~q_vecs[thread_group_offset][0], ~k_vecs[0])
 
                         if thread_group_offset == 0:
                             mask = token_idx >= context_len
@@ -630,12 +631,6 @@ class PageAttentionOpV2(OpaqueOperator):
                             qk_max = qk_max if mask else max(qk_max, qk)
                     
                     block_idx += NUM_WARPS
-                
-                # syncthreads()
-                # if thread_idx == 0:
-                #     for i in range(context_len):
-                #         printf("%f ", logits[i])
-                # syncthreads()
 
                 m1 = WARP_SIZE // 2
                 while m1 >= THREAD_GROUP_SIZE:
@@ -664,9 +659,6 @@ class PageAttentionOpV2(OpaqueOperator):
                 
                 exp_sum = block_sum(~red_smem[NUM_WARPS], exp_sum)
 
-                # syncthreads()
-                # printf("(%d: %f) ", thread_idx, exp_sum)
-                # syncthreads()
                 inv_sum = 1 / (exp_sum + 1e-6)
                 
                 # for i in range(thread_idx, num_tokens, num_threads):
@@ -692,8 +684,6 @@ class PageAttentionOpV2(OpaqueOperator):
                 for i in range(NUM_ROWS_PER_THREAD):
                     accs[i] = 0.0
                 
-                # for i in range(NUM_ROWS_PER_THREAD):
-                #     printf("(%d: %f) ", thread_idx, accs[i])
                 
                 # for block_idx in range(start_block_idx + warp_idx, end_block_idx, NUM_WARPS):
                 block_idx = start_block_idx + warp_idx
@@ -707,10 +697,6 @@ class PageAttentionOpV2(OpaqueOperator):
 
                     v_ptr = v_cache + physical_block_number * kv_block_stride + kv_head_idx * kv_head_stride
 
-                    # nan = 0.0
-                    # nan /= 0.0
-                    # if threadIdx.x == 0:
-                    #     printf("nan %f \n", -nan)
                     for i in range(NUM_ROWS_PER_THREAD):
                         row_idx = lane // NUM_V_VECS_PER_ROW + i * NUM_ROWS_PER_ITER
                         if row_idx < head_size:
@@ -723,27 +709,13 @@ class PageAttentionOpV2(OpaqueOperator):
                                     else:
                                         cast(~v_vec, ~dtype)[j] = dtype(0.0)
                             
-                            # accs[i] += dot(~logits_vec, ~v_vec)
                             for j in range(V_VEC_SIZE):
                                 lv = cast(~logits_vec, ~f32)[j]
                                 rv = cast(cast(~v_vec, ~dtype)[j], f32)
                                 k = lv * rv
-                                # assert cast(cast(~v_vec, ~dtype)[j], f32) != nan
-                                # assert cast(~logits_vec, ~f32)[j] != nan
-                                # assert k != nan
                                 accs[i] += k
-                                # assert accs[i] != nan
-
-                                # printf("accs[%d][%i]: %f %f %f\n", thread_idx, i, k, lv, rv)
-
-                                # if token_idx + j < context_len:
-                                #     accs[i] += 1.0 / f32(context_len)# * cast(~v_vec, ~dtype)[j]
 
                     block_idx += NUM_WARPS
-                
-                # syncthreads()
-                # printf("(%d: %f) ", thread_idx, accs[0])
-                # syncthreads()
 
                 for i in range(NUM_ROWS_PER_THREAD):
                     acc = accs[i]
@@ -753,13 +725,6 @@ class PageAttentionOpV2(OpaqueOperator):
                         m1 //= 2
                     accs[i] = acc
                 
-                # syncthreads()
-                # if thread_idx == 0:
-                #     printf("\n")
-                # syncthreads()
-                # printf("(%d: %f) ", thread_idx, accs[0])
-                # syncthreads()
-                    
                 syncthreads()
 
                 out_smem = cast(logits, ~f32)
@@ -789,13 +754,6 @@ class PageAttentionOpV2(OpaqueOperator):
 
                     m1 //= 2
                 
-                # syncthreads()
-                # if thread_idx == 0:
-                #     printf("\n")
-                # syncthreads()
-                # printf("(%d: %f) ", thread_idx, accs[0])
-                # syncthreads()
-
                 if warp_idx == 0:
                     out_ptr = out + seq_idx * max_num_partitions * num_heads * head_size + head_idx * max_num_partitions * head_size + partition_idx * head_size
 
@@ -803,7 +761,7 @@ class PageAttentionOpV2(OpaqueOperator):
                         row_idx = lane // NUM_V_VECS_PER_ROW + i * NUM_ROWS_PER_ITER
                         if row_idx < head_size and lane % NUM_V_VECS_PER_ROW == 0:
                             out_ptr[row_idx] = cast(accs[i], dtype)
-
+            
             @hidet.script
             def launch(
                 query: dtype[bs, num_heads_, 1, head_size],
@@ -817,7 +775,7 @@ class PageAttentionOpV2(OpaqueOperator):
 
                 page_attention_kernel(
                     0, 0, # exp_sums, max_logits
-                    output, query, key_cache, value_cache, num_kv_heads, 1.0, 
+                    output, query, key_cache, value_cache, num_kv_heads, qk_scale, 
                     cache_blocks, 
                     seq_lengths, 
                     max_cache_blocks, 
@@ -887,84 +845,3 @@ def page_attention(query: Tensor, seq_lengths: Tensor, cache_blocks: Tensor, key
     """
     return PageAttentionOpV2(query, seq_lengths, cache_blocks, key_cache, value_cache, max_context_len).outputs[0]
 
-
-import torch
-
-def make_inputs_dense(bs=4, num_heads=8, head_size=4, seq_len=64, block_size=16, dtype=torch.float32):
-    num_blocks = (bs * seq_len + block_size - 1) // block_size
-
-    query = torch.randn([bs, num_heads, 1, head_size], device='cuda', dtype=dtype)
-    seq_lengths = torch.full([bs], seq_len, device='cuda', dtype=torch.int)
-    cache_blocks = torch.arange(0, num_blocks, 1, device='cuda', dtype=torch.int).reshape([bs, -1])
-    key_cache = torch.randn([num_blocks, num_heads, head_size, block_size], device='cuda', dtype=dtype)
-    val_cache = torch.randn_like(key_cache)
-    return query, seq_lengths, cache_blocks, key_cache, val_cache
-
-from vllm.model_executor.layers.attention import _paged_attention
-from vllm.model_executor import InputMetadata
-
-def page_attention_vllm(query: Tensor, seq_lengths: Tensor, cache_blocks: Tensor, key_cache: Tensor, value_cache: Tensor, max_context_len: int = 1024, num_kv_heads = None):
-    """
-    query: [bs, num_heads, 1, head_size]
-    key_cache: [num_blocks, num_heads, head_size, block_size]
-    value_cache: [num_blocks, num_heads, head_size, block_size]
-    """
-    bs, nh, _, hs = query.shape
-    x = 16 // torch.tensor([], dtype=query.dtype).element_size()
-    num_blocks, num_heads, head_size, block_size = value_cache.shape
-    if num_kv_heads is None:
-        num_kv_heads = num_heads
-    # key_cache: [num_blocks, num_heads, head_size//x, block_size, x]
-    key_cache = key_cache.view(num_blocks, num_heads, head_size // x, block_size, x)
-    return _paged_attention(
-        query.view(bs, nh, hs), key_cache, value_cache, 
-        InputMetadata(False, None, max_context_len, seq_lengths, cache_blocks, False), num_kv_heads, 1.0, None
-    )
-
-
-import hidet
-
-def hidet_page_attention(query: Tensor, seq_lengths: Tensor, cache_blocks: Tensor, key_cache: Tensor, value_cache: Tensor, max_context_len: int = 1024):
-    hidet.option.cache_dir('zexperiments/cache')
-    hidet.utils.clear_cache_dir()
-    hidet.option.debug_cache_tuning(True)
-    y = page_attention(
-        hidet.from_torch(query), 
-        hidet.from_torch(seq_lengths), 
-        hidet.from_torch(cache_blocks), 
-        hidet.from_torch(key_cache),
-        hidet.from_torch(value_cache),
-        max_context_len=max_context_len
-    )
-    return y.torch().to(query.dtype).squeeze()
-
-def test():
-
-    query, seq_lengths, cache_blocks, key_cache, val_cache = \
-        make_inputs_dense(bs=1, num_heads=1, head_size=64, seq_len=785, block_size=16, dtype=torch.float16)
-    x = 16 // torch.tensor([], dtype=query.dtype).element_size()
-    key_cache_ = key_cache #key_cache.reshape([num_blocks, num_heads, head_size//x, x, block_size]).transpose(-1, -2).reshape([num_blocks, num_heads, head_size, block_size])
-    out1 = page_attention_vllm(query, seq_lengths, cache_blocks, key_cache_, val_cache, max_context_len=1024)
-
-    out2 = hidet_page_attention(query, seq_lengths, cache_blocks, key_cache, val_cache)
-
-    print(out1.shape, out2.shape)
-    print((out1 - out2).abs().max())
-    
-    return out1, out2
-
-
-def test_iter_seq_lens():
-    for seq_len in range(128, 128 * 8):
-        query, seq_lengths, cache_blocks, key_cache, val_cache = \
-            make_inputs_dense(bs=1, num_heads=8, head_size=64, seq_len=seq_len, block_size=16, dtype=torch.float16)
-        out2 = hidet_page_attention(query, seq_lengths, cache_blocks, key_cache, val_cache)
-        x = 16 // torch.tensor([], dtype=query.dtype).element_size()
-        key_cache_ = key_cache #key_cache.reshape([num_blocks, num_heads, head_size//x, x, block_size]).transpose(-1, -2).reshape([num_blocks, num_heads, head_size, block_size])
-        out1 = page_attention_vllm(query, seq_lengths, cache_blocks, key_cache_, val_cache, max_context_len=max(1024, seq_len))
-        print("iter", seq_len)
-        print((out1 - out2).abs().max())
-
-if __name__ == '__main__':
-    out1, out2 = test()
-    # test_iter_seq_lens()
