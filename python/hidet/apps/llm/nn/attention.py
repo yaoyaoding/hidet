@@ -44,8 +44,14 @@ class DefaultAttnState(AttentionState):
             # decode stage
             # key_cache, value_cache: [bs, num_kv_heads, past_length, head_size]
             # key, query: [bs, num_heads, 1, head_size]
-            key = ops.concat([self.key_cache, key], axis=-2)
-            value = ops.concat([self.value_cache, value], axis=-2)
+            # if self.key_cache is None:
+            #     self.key_cache = key
+            # if self.value_cache is None:
+            #     self.value_cache = value
+            if self.key_cache is not None:
+                key = ops.concat([self.key_cache, key], axis=-2)
+            if self.value_cache is not None:
+                value = ops.concat([self.value_cache, value], axis=-2)
             self.key_cache = key
             self.value_cache = value
 
@@ -76,9 +82,9 @@ class PagedAttnState(AttentionState):
 
     def run(self, query: Tensor, key: Tensor, value: Tensor) -> Tensor:
         # write the key and value to cache
-        self.key_cache, self.value_cache = cache_write(
-            self.seq_lengths, key, value, self.cache_slots, self.key_cache, self.value_cache
-        )
+        # self.key_cache, self.value_cache = cache_write(
+        #     self.seq_lengths, key, value, self.cache_slots, self.key_cache, self.value_cache
+        # )
 
         if self.is_prefill:
             return flash_attention(query=query, key=key, value=value)
