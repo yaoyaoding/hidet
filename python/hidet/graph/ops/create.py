@@ -15,6 +15,7 @@ import warnings
 from hidet.ir import dtypes
 from hidet.ir.expr import Constant, Expr, Int, if_then_else
 from hidet.ir.type import DataType, data_type
+from hidet.ir.tools import infer_type
 from hidet.runtime.device import Device, instantiate_device
 from .utils import Task, Operator, Tensor, compute
 
@@ -143,9 +144,9 @@ class FullOp(Operator):
                 dtype = dtypes.float32
             elif isinstance(value, bool):
                 dtype = dtypes.boolean
-            elif isinstance(value, Constant):
-                assert isinstance(value.type, DataType)
-                dtype = value.type
+            elif isinstance(value, Expr):
+                dtype = infer_type(value)
+                assert isinstance(dtype, DataType)
             else:
                 raise ValueError(f'Unknown type for value {value}')
 

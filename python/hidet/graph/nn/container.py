@@ -10,7 +10,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from __future__ import annotations
-from typing import Iterable
+from typing import Iterable, Iterator
 from collections import OrderedDict
 from .module import Module
 
@@ -40,7 +40,7 @@ class ModuleList(Module):
         for idx, module in enumerate(modules):
             self._submodules[str(idx)] = module
 
-    def __iter__(self):
+    def __iter__(self) -> Iterator[Module]:
         return iter(self._submodules.values())
 
     def forward(self, *args):

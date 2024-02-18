@@ -97,6 +97,8 @@ class Codegen(ModuleFunctor, StmtFunctor, ExprFunctor, TypeFunctor):
             ret = 'uint8_t({})'.format(int(value))
         elif dtype == dtypes.float16x2:
             ret = 'half2({}, {})'.format(float(value[0]), float(value[0]))
+        elif dtype == dtypes.float32x2:
+            ret = 'float2{' + '{}, {}'.format(float(value[0]), float(value[0])) + '}'
         elif dtype == dtypes.int8x4:
             ret = 'make_char4({}, {}, {}, {})'.format(int(value[0]), int(value[1]), int(value[2]), int(value[3]))
         elif dtype.is_complex():
@@ -622,7 +624,8 @@ class Codegen(ModuleFunctor, StmtFunctor, ExprFunctor, TypeFunctor):
             'complex64': 'complex64_t',
             'complex128': 'complex128_t',
             'float16x2': 'half2',
-            'float32x4': '__m128',
+            'float32x2': 'float2',
+            'float32x4': 'float4',
             'float32x8': '__m256',
             'int8x4': 'char4',
             'uint8x4': 'uint4',

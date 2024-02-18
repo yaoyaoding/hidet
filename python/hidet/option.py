@@ -285,6 +285,12 @@ def register_hidet_options():
         default_value=True,
         description='Whether to enable imperative execution when op arguments allows',
     )
+    register_option(
+        name='tokens.for_huggingface',
+        type_hint='str',
+        default_value='',
+        description='The tokens to use for accessing private huggingface models. ',
+    )
 
     config_file_path = os.path.join(os.path.expanduser('~'), '.config', 'hidet')
     if not os.path.exists(config_file_path):
@@ -1035,6 +1041,20 @@ class compile_server:
         """
         OptionContext.current().set_option('compile_server.repo_url', repo_url)
         OptionContext.current().set_option('compile_server.repo_version', version)
+
+
+class tokens:
+    @staticmethod
+    def for_huggingface(token: str):
+        """
+        Set the token for accessing to huggingface.
+
+        Parameters
+        ----------
+        token: str
+            The token for huggingface.
+        """
+        OptionContext.current().set_option('tokens.for_huggingface', token)
 
 
 # load the options from config file (e.g., ~/.config/hidet.config) if exists
