@@ -178,6 +178,207 @@ class PageAttentionWriteCacheOp(OpaqueOperator):
         return script_module.ir_module()
 
 
+class PageAttentionWriteCacheV2Op(OpaqueOperator):
+    def __init__(self, seq_lengths, key, value, cache_slots, key_cache, value_cache):
+        # seq_lengths: [bs]
+        #   key: [bs, num_kv_heads, max_seq_length, head_size]
+        # value: [bs, num_kv_heads, max_seq_length, head_size]
+        # cache_slots: [bs, max_seq_length]
+        # key_cache: [num_blocks, num_kv_heads, head_size, block_size]
+        # value_cache: [num_blocks, num_kv_heads, head_size, block_size]
+        assert key.dtype == key_cache.dtype == value.dtype == value_cache.dtype
+        super().__init__(
+            name='cache_write',
+            inputs={
+                'seq_lengths': seq_lengths,
+                'key': key,
+                'value': value,
+                'cache_slots': cache_slots,
+                'key_cache': key_cache,
+                'value_cache': value_cache,
+            },
+            share_map={0: 4, 1: 5},  # share key_cache and value_cache
+        )
+
+    def symbolic_forward(self, seq_lengths, key, value, cache_slots, key_cache, value_cache):
+        return {'key_cache_out': key_cache, 'value_cache_out': value_cache}
+
+    def implement_cuda(self, inputs: List[Tensor], outputs: List[Tensor]) -> Union[IRModule, List[IRModule]]:
+        return tune.extract_ir_modules(self.schedule_cuda)
+
+    @tune.space(1)  # empty space
+    def schedule_cuda(self):
+        import hidet
+        from hidet.lang import attrs, printf
+        from hidet.lang.types import i32, f16, f32, i64, shared_tensor
+        from hidet.ir.dtypes import boolean
+        from hidet.lang.cuda import blockIdx, threadIdx, blockDim, syncthreads
+        from hidet.lang.mapping import spatial
+
+        dtype = self.inputs[4].dtype
+        x = 16 // dtype.nbytes
+        
+        bs, num_kv_heads, max_seq_length, head_size = self.inputs[1].shape
+        num_blocks, num_kv_heads, head_size, block_size = self.inputs[4].shape
+
+        with hidet.script_module() as script_module:
+            seq_tile = 1
+            dim_tile = 1
+            assert int(head_size % (dim_tile * 4)) == 0
+            assert int(block_size % (seq_tile * 4)) == 0
+
+            @hidet.script
+            def _normal_to_kcache_coords(
+                dim_idx: i32,
+                block_offset: i32
+            ) -> i32:
+                # x.reshape(hi // x, x, bi).permute(0, 2, 1).reshape(hi, bi)
+                ih = dim_idx // x
+                ix = dim_idx % x
+
+                j = ix + block_offset * x + ih * block_size * x
+                return j
+
+
+            @hidet.script
+            def _prefill_cache_write(
+                seq_lengths: i32[bs],
+                inp: dtype[bs, num_kv_heads, max_seq_length, head_size],
+                cache_slots: i64[bs, max_seq_length],
+                cache: dtype[num_blocks, num_kv_heads, head_size, block_size],
+                buf: dtype[seq_tile, dim_tile * 4 + 1],
+                is_key: boolean,
+            ):
+                attrs.func_kind = 'cuda_internal'
+
+                bs_idx = blockIdx.x
+                kv_head_idx = blockIdx.y
+                seq_length = seq_lengths[bs_idx]
+
+                for t in range((seq_length + seq_tile - 1) // seq_tile):
+                    if (t + 1) * seq_tile < seq_length:
+                        # do not need to check boundary
+                        for j in range(head_size // (dim_tile * 4)):
+                            # read to buf [seq_tile, dim_tile * 4]
+                            for i, jj in spatial(seq_tile, dim_tile).on(threadIdx.x):
+                                for jjj in range(4):
+                                    seq_idx = t * seq_tile + i
+                                    dim_idx = j * (dim_tile * 4) + jj * 4 + jjj
+                                    buf[i, jj * 4 + jjj] = inp[bs_idx, kv_head_idx, seq_idx, dim_idx]
+                            syncthreads()
+
+                            # write buf to cache in global memory
+                            for jj, ii in spatial(dim_tile, seq_tile).on(threadIdx.x):
+                                seq_idx = t * seq_tile + ii
+                                cache_slot = cache_slots[bs_idx, seq_idx]
+                                block_idx = i32(cache_slot // block_size)
+                                block_offset = i32(cache_slot % block_size)
+                                for jjj in range(4):
+                                    dim_idx = j * dim_tile * 4 + jj * 4 + jjj
+                                    if not is_key:
+                                        cache[block_idx, kv_head_idx, dim_idx, block_offset] = buf[ii, jj * 4 + jjj]
+                                    else:
+                                        ptr = ~cache[block_idx, kv_head_idx, 0, 0]
+                                        # [hi, bi].reshape(hi // x, x, bi).permute(0, 2, 1).reshape(hi, bi)
+                                        ptr = ptr + _normal_to_kcache_coords(dim_idx, block_offset)
+                                        ptr[0] = buf[ii, jj * 4 + jjj]
+                            syncthreads()
+                    else:
+                        # do not need to check boundary
+                        for j in range(head_size // (dim_tile * 4)):
+                            # read to buf [seq_tile, dim_tile * 4]
+                            for i, jj in spatial(seq_tile, dim_tile).on(threadIdx.x):
+                                for jjj in range(4):
+                                    seq_idx = t * seq_tile + i
+                                    dim_idx = j * (dim_tile * 4) + jj * 4 + jjj
+                                    if seq_idx < seq_length:
+                                        buf[i, jj * 4 + jjj] = inp[bs_idx, kv_head_idx, seq_idx, dim_idx]
+                            syncthreads()
+
+                            # write buf to cache in global memory
+                            for jj, ii in spatial(dim_tile, seq_tile).on(threadIdx.x):
+                                seq_idx = t * seq_tile + ii
+                                if seq_idx < seq_length:
+                                    cache_slot = cache_slots[bs_idx, seq_idx]
+                                    block_idx = i32(cache_slot // block_size)
+                                    block_offset = i32(cache_slot % block_size)
+                                    for jjj in range(4):
+                                        dim_idx = j * dim_tile * 4 + jj * 4 + jjj
+                                        if not is_key:
+                                            cache[block_idx, kv_head_idx, dim_idx, block_offset] = buf[ii, jj * 4 + jjj]
+                                        else:
+                                            ptr = ~cache[block_idx, kv_head_idx, 0, 0]
+                                            # [hi, bi].reshape(hi // x, x, bi).permute(0, 2, 1).reshape(hi, bi)
+                                            ptr = ptr + _normal_to_kcache_coords(dim_idx, block_offset)
+                                            ptr[0] = buf[ii, jj * 4 + jjj]
+                            syncthreads()
+
+            @hidet.script
+            def prefill_cache_write(
+                seq_lengths: i32[bs],
+                key: dtype[bs, num_kv_heads, max_seq_length, head_size],
+                value: dtype[bs, num_kv_heads, max_seq_length, head_size],
+                cache_slots: i64[bs, max_seq_length],
+                key_cache: dtype[num_blocks, num_kv_heads, head_size, block_size],
+                value_cache: dtype[num_blocks, num_kv_heads, head_size, block_size],
+            ):
+                attrs.func_kind = 'cuda_kernel'
+                attrs.cuda.grid_dim = bs, num_kv_heads
+                attrs.cuda.block_dim = seq_tile * dim_tile
+
+                buf = shared_tensor(dtype=dtype, shape=[seq_tile, dim_tile * 4 + 1])
+
+                _prefill_cache_write(seq_lengths, key, cache_slots, key_cache, buf, True)
+                _prefill_cache_write(seq_lengths, value, cache_slots, value_cache, buf, False)
+
+            @hidet.script
+            def decode_cache_write(
+                seq_lengths: i32[bs],
+                key: dtype[bs, num_kv_heads, 1, head_size],
+                value: dtype[bs, num_kv_heads, 1, head_size],
+                cache_slots: i64[bs, 1],
+                key_cache: dtype[num_blocks, num_kv_heads, head_size, block_size],
+                value_cache: dtype[num_blocks, num_kv_heads, head_size, block_size],
+            ):
+                attrs.func_kind = 'cuda_kernel'
+                attrs.cuda.grid_dim = bs, num_kv_heads
+                attrs.cuda.block_dim = head_size
+
+                bs_idx = blockIdx.x
+                kv_head_idx = blockIdx.y
+                dim_idx = threadIdx.x
+
+                # get cache slot
+                cache_slot = cache_slots[bs_idx, 0]
+                block_idx = cache_slot / block_size
+                block_offset = cache_slot % block_size
+
+                # store key and value to cache
+                key_ptr = ~key_cache[block_idx, kv_head_idx, 0, 0]
+                key_ptr = key_ptr + _normal_to_kcache_coords(dim_idx, block_offset)
+                key_ptr[0] = key[bs_idx, kv_head_idx, 0, dim_idx]
+                value_cache[block_idx, kv_head_idx, dim_idx, block_offset] = value[bs_idx, kv_head_idx, 0, dim_idx]
+
+            @hidet.script
+            def launch(
+                seq_lengths: i32[bs],
+                key: dtype[bs, num_kv_heads, max_seq_length, head_size],
+                value: dtype[bs, num_kv_heads, max_seq_length, head_size],
+                cache_slots: i64[bs, max_seq_length],
+                key_cache: dtype[num_blocks, num_kv_heads, head_size, block_size],
+                value_cache: dtype[num_blocks, num_kv_heads, head_size, block_size],
+                key_cache_out: dtype[num_blocks, num_kv_heads, head_size, block_size],
+                value_cache_out: dtype[num_blocks, num_kv_heads, head_size, block_size],
+            ):
+                attrs.func_kind = 'public'
+
+                if max_seq_length == 1:
+                    decode_cache_write(seq_lengths, key, value, cache_slots, key_cache, value_cache)
+                else:
+                    prefill_cache_write(seq_lengths, key, value, cache_slots, key_cache, value_cache)
+
+        return script_module.ir_module()
+
 class PageAttentionOp(OpaqueOperator):
     def __init__(
         self, query: Tensor, seq_lengths: Tensor, cache_blocks: Tensor, key_cache: Tensor, value_cache: Tensor
@@ -841,7 +1042,7 @@ def cache_write(
         updated_key_cache: The updated key cache. Shape: [num_blocks, num_kv_heads, head_size, block_size]
         updated_value_cache: The updated value cache. Shape: [num_blocks, num_kv_heads, head_size, block_size]
     """
-    return PageAttentionWriteCacheOp(seq_lengths, key, value, cache_slots, key_cache, value_cache).outputs
+    return PageAttentionWriteCacheV2Op(seq_lengths, key, value, cache_slots, key_cache, value_cache).outputs
 
 
 def page_attention(
@@ -878,3 +1079,4 @@ def page_attention(
         The output tensor. Shape: [bs, num_heads, 1, head_size]
     """
     return PageAttentionOpV2(query, seq_lengths, cache_blocks, key_cache, value_cache, max_context_len).outputs[0]
+    # return PageAttentionOp(query, seq_lengths, cache_blocks, key_cache, value_cache).outputs[0]

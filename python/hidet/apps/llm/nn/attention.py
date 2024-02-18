@@ -32,7 +32,8 @@ class DefaultAttnState(AttentionState):
 
             key = ops.transpose(key, axes=[0, 1, 3, 2])  # [bs, num_heads, head_size, seq_length]
             # [1, num_heads, seq_length, seq_length]
-            score = ops.matmul(query, key) / math.sqrt(cast(query.shape[-2], f32))
+            inv = ops.full([], query.shape[-2]).to(f32) ** (-0.5)
+            score = ops.matmul(query, key) * inv
             seq_length = score.shape[-1]
             tri = ops.tri(seq_length, seq_length, dtype=score.dtype, device=score.device)
             causal_mask = (1.0 - tri) * score.dtype.min_value
@@ -82,9 +83,9 @@ class PagedAttnState(AttentionState):
 
     def run(self, query: Tensor, key: Tensor, value: Tensor) -> Tensor:
         # write the key and value to cache
-        # self.key_cache, self.value_cache = cache_write(
-        #     self.seq_lengths, key, value, self.cache_slots, self.key_cache, self.value_cache
-        # )
+        self.key_cache, self.value_cache = cache_write(
+            self.seq_lengths, key, value, self.cache_slots, self.key_cache, self.value_cache
+        )
 
         if self.is_prefill:
             return flash_attention(query=query, key=key, value=value)

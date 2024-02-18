@@ -47,8 +47,12 @@ class LlamaRMSNorm(nn.Module):
 
 
 class LlamaRotaryEmbedding(nn.Module):
-    def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
+    def __init__(self, dim, max_position_embeddings=2048, base=10000, scaling_factor=1.0, device=None):
         super().__init__()
+        seq_len = max_position_embeddings
+        base = base * (
+                (scaling_factor * seq_len / max_position_embeddings) - (scaling_factor - 1)
+            ) ** (dim / (dim - 2))
         inv_freq = hidet.asarray(1.0).to(device) / (
             hidet.asarray(base).to(device) ** (hidet.arange(0, dim, 2).float().to(device=device) / dim)
         )

@@ -26,10 +26,12 @@ def flash_attention(query: Tensor, key: Tensor, value: Tensor) -> Tensor:
     """
     # return _attention(query, key, value, is_causal=True)
     from hidet.ir.expr import cast
+    from hidet.ir.dtypes import f32
 
     key = ops.transpose(key, axes=[0, 1, 3, 2])  # [bs, num_heads, head_size, seq_length]
     # [1, num_heads, seq_length, seq_length]
-    score = ops.matmul(query, key) / math.sqrt(query.shape[-2])
+    inv = ops.full([], query.shape[-2]).to(f32) ** (0.5)
+    score = ops.matmul(query, key) / inv
     seq_length = score.shape[-1]
     tri = ops.tri(seq_length, seq_length, dtype=score.dtype, device=score.device)
     causal_mask = (1.0 - tri) * score.dtype.min_value

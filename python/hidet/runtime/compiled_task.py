@@ -320,6 +320,7 @@ def _check_inputs(traced_inputs: Iterable[TensorSignature], inputs):
     from hidet import ir
 
     symbol_map = {}
+    assert len(traced_inputs) == len(inputs)
     for i, (traced, new) in enumerate(zip(traced_inputs, inputs)):
         traced_dev_kind = traced.device.partition(':')[0]
         if traced_dev_kind != new.device.target:
